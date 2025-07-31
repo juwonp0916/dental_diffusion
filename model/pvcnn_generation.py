@@ -192,7 +192,9 @@ class PVCNN2Base(nn.Module):
         self.in_channels = extra_feature_channels + 3
 
         # embedding to uniquely identify fdi
-        self.fdi_embedding = nn.Embedding(num_embeddings=28, embedding_dim=8)
+        FDIS = [18, 17, 16, 15, 14, 13, 12, 11, 21, 22, 23, 24, 25, 26, 27, 28,
+        38, 37, 36, 35, 34, 33, 32, 31, 41, 42, 43, 44, 45, 46, 47, 48]
+        self.fdi_embedding = nn.Embedding(num_embeddings=len(FDIS), embedding_dim=8)
 
         sa_layers, sa_in_channels, channels_sa_features, _ = create_pointnet2_sa_components(
             sa_blocks=self.sa_blocks, extra_feature_channels=extra_feature_channels, with_se=True, embed_dim=embed_dim,
@@ -251,7 +253,7 @@ class PVCNN2Base(nn.Module):
         return emb
 
 
-    def forward(self, xt, t, x0, l_mask, o_mask, bound):
+    def forward(self, xt, t, x0, l_mask, o_mask, bound=None):
 
         # xt: (B, 28, 3, 1024)
         # x0: (B, 28, 3, 1024)
@@ -262,15 +264,15 @@ class PVCNN2Base(nn.Module):
         B, nT, nD, nP = xt.shape
         t = t.view(B, 1).expand(B, nT).reshape(B*nT)
 
-        frame_indices = torch.arange(28, device=x0.device).unsqueeze(0).repeat(B,1)
+        frame_indices = torch.arange(nT, device=x0.device).unsqueeze(0).repeat(B,1)
         fdi_embeddings = self.fdi_embedding(frame_indices) # (B, 28, 8)
 
-        bound_embedding = self.bound_embedding(bound)
-        bound_embedding_transformed = self.bound_transformer(bound_embedding)
-        bound_embedding_transformed = self.bound_final_ln(bound_embedding_transformed).reshape(B*nT, self.embed_dim)
+        # bound_embedding = self.bound_embedding(bound)
+        # bound_embedding_transformed = self.bound_transformer(bound_embedding)
+        # bound_embedding_transformed = self.bound_final_ln(bound_embedding_transformed).reshape(B*nT, self.embed_dim)
 
         temb_raw = self.embedf(self.get_timestep_embedding(t, xt.device))
-        temb_raw = temb_raw + bound_embedding_transformed
+        # temb_raw = temb_raw + bound_embedding_transformed
 
 
         temb = temb_raw[:, :, None].expand(-1, -1, xt.shape[-1])

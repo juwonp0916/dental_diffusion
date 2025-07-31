@@ -1,7 +1,7 @@
 import os
 os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
 # os.environ['CUDA_VISIBLE_DEVICES'] = "0,1,2,3,4,5,6,7"
-os.environ['CUDA_VISIBLE_DEVICES'] = "0,1,2,3"
+os.environ['CUDA_VISIBLE_DEVICES'] = "0,1,2,3,4,5"
 
 from collections import OrderedDict
 import re
@@ -459,27 +459,44 @@ def generate_val_samples(opt, model, val_dataset, outf_syn, epoch, device):
     sample_batch_size = 1 # how many validation samples to generate 
     val_sample_list = val_dataset.sample_patient(sample_batch_size)
     val_dentition_points = torch.stack([sample['dentition_points'] for sample in val_sample_list], 0).to(device)
-    val_bound = torch.stack([sample['bounds_cyl'] for sample in val_sample_list], 0).to(device)
+    # val_bound = torch.stack([sample['bounds_cyl'] for sample in val_sample_list], 0).to(device)
     val_dentition_ids = [sample['patient_id'] for sample in val_sample_list]
 
     latent_mask_val = torch.zeros_like(val_dentition_points[:,:,:1,:1]).to(device)
+    non_existent_val = torch.zero_like(latent_mask_val).to(device)
+    #List of all fdi numbers
+    all_fdi = list(range(11, 19)) + list(range(21, 29)) + list(range(31, 39)) + list(range(41, 49))
 
     for i in range(sample_batch_size):
         n_missing_val = random.randint(1, opt.max_missing_teeth)
         # TODO 
         # 1. What if some teeth are already missing to begin with? (X assume all 28 teeth are present in the training dentition)
         # 2. We want to avoid selecting wisdom teeth (FDI ~8) for simulating missing teeth 
-        missing_indices_val = torch.randperm(28)[:n_missing_val]
-    
+        # Create a new mask that only include those teeth that are missing
+        present_fdi = val_sample_list[i].get('present_fdi', all_fdi)
+
+        #Missing FDI 
+        non_existent_fdi = [fdi for fdi in all_fdi if fdi not in present_fdi]
+        non_existent_idx = [all_fdi.index(fdi) for fdi in non_existent_fdi]
+
+        #Non-existent teeth
+        if non_existent_idx:
+            non_existent_val[i, non_existent_idx, 0, 0] = 1
+
+        # Deliberately missing
+        nT = val_dentition_points.shape[1] # Number of teeth
+        missing_indices_val = torch.randperm(nT)[:n_missing_val]
         latent_mask_val[i, missing_indices_val, 0, 0] = 1
 
-    obs_mask_val = torch.ones_like(latent_mask_val) - latent_mask_val
+    non_existent_mask = non_existent_val.clone()
+    obs_mask_val = torch.ones_like(latent_mask_val) - latent_mask_val - non_existent_mask
+    obs_mask_val = torch.camp(obs_mask_val, min = 0)
 
     val_data_dict = {
         'x0': val_dentition_points,
         'l_mask': latent_mask_val,
         'o_mask':obs_mask_val,
-        'bound':val_bound
+        # 'bound':val_bound
     }
 
     # generate some samples
@@ -600,20 +617,30 @@ def train(local_rank, opt, output_dir):
         for i, data in enumerate(dataloader):
             
             dentition_points = data['dentition_points'].to(device) # (b, K, 3, 1024)
-            bound = data['bounds_cyl'].to(device) #(b, 28, 5)
-            B, nT, nD, nP = dentition_points.shape
-            
+            # Auxiliary condition
+            # bound = data['bounds_cyl'].to(device) #(b, 28, 5)
+            # B, nT, nD, nP = dentition_points.shape
+            B = dentition_points.shape[0]
             latent_mask = torch.zeros_like(dentition_points[:,:,:1,:1]).to(device)
+
+            #Exclude wisdom teeth
+            all_fdi = list(range(11, 19)) + list(range(21, 29)) + list(range(31, 39)) + list(range(41, 49))
+            wisdom_fdi = [18, 28, 38, 48] 
 
             for b in range(B):
                 # Randomly select the number of missing teeth
                 n_missing = random.randint(1, opt.max_missing_teeth)
-                
                 # IMPORTANT, randomly select teeth to "Omit" for simulation
                 missing_indices = torch.randperm(28)[:n_missing]
                 # TODO 
                 # 1. What if some teeth are already missing to begin with? (X assume all 28 teeth are present in the training dentition)
                 # 2. We want to avoid selecting wisdom teeth FDI ~8 for simulating missing teeth 
+                present_fdi = data.get('present_fdi', [all_fdi]*B)[b]
+                eligible_fdi = [fdi for fdi in present_fdi if fdi not in wisdom_fdi]
+                eligible_indices = [all_fdi.index(fdi) for fdi in eligible_fdi]
+
+                if not eligible_indices:
+                    continue
 
                 latent_mask[b, missing_indices, 0, 0] = 1
 
@@ -629,7 +656,7 @@ def train(local_rank, opt, output_dir):
                 'x0': dentition_points,
                 'l_mask': latent_mask,
                 'o_mask':obs_mask,
-                'bound':bound
+                # 'bound':bound
             }
             loss = model.get_loss_iter_teethmask(noise_batch, model_kwargs=data_dict)
 
