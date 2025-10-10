@@ -6,9 +6,7 @@ from glob import glob
 
 
 # TODO we want to include wisdom teeth as well. BUT only as context teeth.
-# FDIS=[17,47,16,46,15,45,14,44,13,43,12,42,11,41,21,31,22,32,23,33,24,34,25,35,26,36,27,37]
-FDIS = [18, 17, 16, 15, 14, 13, 12, 11, 21, 22, 23, 24, 25, 26, 27, 28,
-        38, 37, 36, 35, 34, 33, 32, 31, 41, 42, 43, 44, 45, 46, 47, 48]
+FDIS=[17,47,16,46,15,45,14,44,13,43,12,42,11,41,21,31,22,32,23,33,24,34,25,35,26,36,27,37]
 
 
 class ToothDataset(th.utils.data.Dataset):
@@ -23,29 +21,56 @@ class ToothDataset(th.utils.data.Dataset):
         self.aug_transforms = aug_transforms
         self.tooth_npoints = tooth_npoints
 
-        self.data_path = os.path.join(path, 'dentition')
+        self.data_path = path
 
         self.preloaded_dentition = {}
-        patient_id_list = np.loadtxt(os.path.join(self.data_path, f'{self.mode}_patients.txt'), str)
 
-        print('Preloading data...')
+        # Get all patient folders (both U and L variants)
+        patient_folders = []
+        for folder in os.listdir(self.data_path):
+            if os.path.isdir(os.path.join(self.data_path, folder)) and ('U' in folder or 'L' in folder):
+                patient_folders.append(folder)
 
-        for idx, patient_id in enumerate(patient_id_list): 
-            
+        # Group by patient base ID (e.g., DBT1_0002L and DBT1_0002U -> DBT1_0002)
+        patient_groups = {}
+        for folder in patient_folders:
+            base_id = folder[:-1]  # Remove 'U' or 'L' suffix
+            if base_id not in patient_groups:
+                patient_groups[base_id] = []
+            patient_groups[base_id].append(folder)
+
+        # Create patient list based on mode (using 80/20 split for now)
+        all_patients = sorted(patient_groups.keys())
+        split_idx = int(0.8 * len(all_patients))
+
+        if self.mode == 'train':
+            patient_id_list = all_patients[:split_idx]
+        else:  # val mode
+            patient_id_list = all_patients[split_idx:]
+
+        print(f'Preloading {len(patient_id_list)} patients for {self.mode} mode...')
+
+        for idx, patient_id in enumerate(patient_id_list):
             self.preloaded_dentition[idx] = {'patient_id':patient_id, 'data':{}}
-
             # self.preloaded_dentition[idx] = {'patient_id':patient_id, 'data':{}, 'bounds':{}}
-            for vert_path in glob(os.path.join(self.data_path, patient_id, 'verts', '*')):
-                teeth_name = os.path.basename(vert_path)
-                fdi = int(teeth_name.split('_')[-1].replace('.npy','').replace('FDI',''))
-                if fdi not in FDIS:
+
+            # Load from both upper and lower jaw folders for this patient
+            for jaw_folder in patient_groups[patient_id]:
+                jaw_path = os.path.join(self.data_path, jaw_folder, 'verts')
+                if not os.path.exists(jaw_path):
                     continue
 
-                self.preloaded_dentition[idx]['data'][fdi] = np.load(vert_path)
+                for vert_path in glob(os.path.join(jaw_path, '*')):
+                    teeth_name = os.path.basename(vert_path)
+                    fdi = int(teeth_name.split('_')[-1].replace('.npy','').replace('FDI',''))
+                    if fdi not in FDIS:
+                        continue
 
-                # Bounding obj stuff
+                    self.preloaded_dentition[idx]['data'][fdi] = np.load(vert_path)
+
+                # Bounding cylinder data - commented out for vertex-only processing
                 # bound_path = vert_path.replace('verts','bounding').replace('.npy','_bounding.json')
-                    
+                #
                 # bound_json = json.load(open(bound_path,'r'))['cylinder']
                 # self.preloaded_dentition[idx]['bounds'][fdi] = {
                 #     'center':np.array([bound_json['cx'],bound_json['cy'],bound_json['cz']]),
@@ -56,68 +81,74 @@ class ToothDataset(th.utils.data.Dataset):
     def __len__(self):
         return len(self.preloaded_dentition)
 
-    def normalize_dentition(self, dentition_arr, bounds_cyl_c_arr, bounds_cyl_s_arr):
+    def normalize_dentition(self, dentition_arr):
+        """
+        Normalize dentition using fixed shift/scale from ICP-registered manual templates.
 
-        #TODO 
-        # Find a standard shift and scale values
-        # Shift - Place the dentition data to the origin
-        # Scale - ensure the dentition points are in (-1,1) range. 
-        # allows more stable training
-    # # 1. Use very rarely-missing teeth(11, 21, 31, 41) to find the shift and scale
-    #     anchor_teeth = [11, 21, 31, 41]
-    #     anchor_idx = None
-    #     for fdi in anchor_teeth:
-    #         if fdi in FDIS:
-    #             idx = FDIS.index(fdi)
-    #             # Check if this tooth is present (not all zeros)
-    #             if not np.allclose(bounds_cyl_c_arr[idx], 0):
-    #                 anchor_idx = idx
-    #                 break
+        Origin is at the middle of full dentition (not between central incisors).
+        Based on manual templates:
+        - Upper jaw: DBT1_0300U (center: [-1.19, 26.69, -11.82])
+        - Lower jaw: DBT1_0655L (center: [-0.24, 24.01, -1.45])
+        - Combined middle: [-0.72, 25.35, -6.64]
+        - Max range: ~78.4 mm (X-axis)
 
-    #     if anchor_idx is not None:
-    #         shift = bounds_cyl_c_arr[anchor_idx]
-    #     else:
-    #         # Fallback: use bounding box center
-    #         bbox_min = np.min(bounds_cyl_c_arr, axis=0)
-    #         bbox_max = np.max(bounds_cyl_c_arr, axis=0)
-    #         shift = (bbox_min + bbox_max) / 2
+        Normalization to [-1, +1] range based on max extent of manual templates.
 
-    #     # Scale: use bounding box diagonal
-    #     bbox_min = np.min(bounds_cyl_c_arr, axis=0)
-    #     bbox_max = np.max(bounds_cyl_c_arr, axis=0)
-    #     bbox_diag = np.linalg.norm(bbox_max - bbox_min)
-    #     scale = bbox_diag if bbox_diag > 1e-7 else 1.0
+        Args:
+            dentition_arr: (28, N, 3) array of point clouds for all teeth
 
-    #     dentition_arr_norm = (dentition_arr - shift) / scale
-    #     bounds_cyl_c_arr_norm = (bounds_cyl_c_arr - shift) / scale
-    #     bounds_cyl_s_arr_norm = bounds_cyl_s_arr / scale
+        Returns:
+            dentition_arr_norm: (28, N, 3) normalized point clouds
+            existing_teeth_mask: (28,) boolean mask indicating which teeth exist
+        """
+        # Fixed shift: middle point of full 28-teeth dentition from ICP-registered templates
+        shift = np.array([[-0.72, 25.35, -6.64]])
 
+        # Fixed scale: half of max range for [-1, +1] normalization
+        # Using 39.2 = 78.4 / 2 (where 78.4 is max X-range from templates)
+        scale = 39.2
 
-    # 2. Use bounding box of the dentition points to find the scale
-        bbox_min = np.min(bounds_cyl_c_arr, axis = 0)
-        bbox_max = np.max(bounds_cyl_c_arr, axis = 0)
-        bbox_center = (bbox_min + bbox_max) / 2
-        bbox_diag = np.linalg.norm(bbox_max - bbox_min)
-
-        dentition_arr_shifted = dentition_arr - bbox_center
-        bounds_cyl_c_arr_shifted = bounds_cyl_c_arr - bbox_center
-        shift = bbox_center
-        scale = bbox_diag
-        # Avoid division by zero
-        
-        scale = bbox_diag if bbox_diag> 1e-7 else 1.0
-
-        # Original values
-        # shift = np.array([[-0.03630271,20.68396041,0.36647236]]) # find new value
-        # scale = np.array([[10.5510643]]) # find new value
-
+        # Apply normalization: (data - shift) / scale
         dentition_arr_norm = (dentition_arr - shift) / scale
-        bounds_cyl_c_arr_norm = (bounds_cyl_c_arr - shift) / scale
-        bounds_cyl_s_arr_norm = (bounds_cyl_s_arr) / scale
 
-        return dentition_arr_norm, bounds_cyl_c_arr_norm, bounds_cyl_s_arr_norm
+        # Create existing teeth mask: detect teeth with real data vs noise
+        # Noise-filled missing teeth have very small ORIGINAL values (~0.05 scale)
+        # Real teeth have much larger coordinate values (>5mm in any dimension)
+        # Check BEFORE normalization to avoid shift effects
+        existing_teeth_mask = np.any(np.abs(dentition_arr) > 1.0, axis=(1, 2))
 
+        return dentition_arr_norm, existing_teeth_mask
 
+    def _validate_normalization(self, original_dentition, normalized_dentition, existing_teeth_mask):
+        """
+        Validate that normalization preserves spatial relationships.
+        """
+        if np.sum(existing_teeth_mask) < 2:
+            return  # Cannot validate spatial relationships with less than 2 teeth
+
+        existing_indices = np.where(existing_teeth_mask)[0]
+
+        # Check that relative distances between teeth are preserved proportionally
+        for i in range(len(existing_indices)):
+            for j in range(i + 1, len(existing_indices)):
+                idx1, idx2 = existing_indices[i], existing_indices[j]
+
+                # Calculate centers of teeth
+                orig_center1 = np.mean(original_dentition[idx1], axis=0)
+                orig_center2 = np.mean(original_dentition[idx2], axis=0)
+                norm_center1 = np.mean(normalized_dentition[idx1], axis=0)
+                norm_center2 = np.mean(normalized_dentition[idx2], axis=0)
+
+                # Calculate relative distances
+                orig_dist = np.linalg.norm(orig_center1 - orig_center2)
+                norm_dist = np.linalg.norm(norm_center1 - norm_center2)
+
+                # Check that distance ratio is consistent (allowing for some scaling)
+                if orig_dist > 1e-6 and norm_dist > 1e-6:
+                    ratio = norm_dist / orig_dist
+                    # Allow reasonable scaling but ensure relative positioning is preserved
+                    if ratio < 0.1 or ratio > 10.0:
+                        print(f"Warning: Large distance ratio {ratio:.3f} between teeth {idx1} and {idx2}")
 
     def sample_patient(self, batch_size: int):
         indexes = np.random.randint(0, len(self), batch_size)
@@ -132,58 +163,60 @@ class ToothDataset(th.utils.data.Dataset):
         patient_id = dentition_data_dict['patient_id']
 
         try:
-
-
             dentition_arr = []
+            fdi_list = []  # NEW: Track actual FDI numbers
             # bounds_cyl_c_arr = []
             # bounds_cyl_s_arr = []
-
-            # for fdi in FDIS:
-            #     vert = dentition_data_dict['data'][fdi]
-            #     random_index = np.random.randint(0, vert.shape[0], self.tooth_npoints) # uniform sampling of 1024 points per tooth
-            #     dentition_arr.append(vert[random_index])
+            original_missing_mask = []
 
             for fdi in FDIS:
                 if fdi in dentition_data_dict['data']:
+                    # Tooth exists in dataset
                     vert = dentition_data_dict['data'][fdi]
                     random_index = np.random.randint(0, vert.shape[0], self.tooth_npoints)
                     dentition_arr.append(vert[random_index])
+                    fdi_list.append(fdi)  # NEW: Store actual FDI number
+                    # bounds_cyl_c_arr.append(dentition_data_dict['bounds'][fdi]['center'])
+                    # bounds_cyl_s_arr.append(dentition_data_dict['bounds'][fdi]['size'])
+                    original_missing_mask.append(False)  # Tooth exists
                 else:
-                    # Fill with zeros if tooth is missing
-                    dentition_arr.append(np.zeros((self.tooth_npoints, 3), dtype=np.float32))
-
-                # bounds_cyl_c_arr.append(dentition_data_dict['bounds'][fdi]['center'])
-                # bounds_cyl_s_arr.append(dentition_data_dict['bounds'][fdi]['size'])
+                    # Tooth is naturally missing, fill with small random noise
+                    noise = np.random.normal(loc=0.0, scale=0.05, size=(self.tooth_npoints, 3))
+                    dentition_arr.append(noise)
+                    fdi_list.append(0)  # NEW: 0 indicates missing tooth
+                    # Use zero bounds for missing teeth
+                    # bounds_cyl_c_arr.append(np.zeros(3))
+                    # bounds_cyl_s_arr.append(np.zeros(2))
+                    original_missing_mask.append(True)  # Tooth is missing
 
 
             dentition_arr = np.array(dentition_arr).reshape(len(FDIS), self.tooth_npoints, 3)
-            # Newly created arrays
-            dentition_arr_norm = (dentition_arr - dentition_arr.mean()) / dentition_arr.std()
             # bounds_cyl_c_arr = np.array(bounds_cyl_c_arr)
             # bounds_cyl_s_arr = np.array(bounds_cyl_s_arr)
 
             # assert bounds_cyl_c_arr.shape == (len(FDIS), 3)
             # assert bounds_cyl_s_arr.shape == (len(FDIS), 2)
 
+            dentition_arr_norm, existing_teeth_mask = self.normalize_dentition(dentition_arr)
             # dentition_arr_norm, bounds_cyl_c_arr_norm, bounds_cyl_s_arr_norm = self.normalize_dentition(dentition_arr,
             #                                                                                             bounds_cyl_c_arr,
             #                                                                                             bounds_cyl_s_arr)
                                                                                                                 
         
+            # Data augmentation - commented out for vertex-only processing
             # if self.aug_transforms and self.mode == 'train':
-
             #     aug_out = self.aug_transforms({'d':dentition_arr_norm, 'bcc':bounds_cyl_c_arr_norm, 'bcs':bounds_cyl_s_arr_norm})
-                
             #     dentition_arr_norm = aug_out['d']
             #     bounds_cyl_c_arr_norm = aug_out['bcc']
             #     bounds_cyl_s_arr_norm = aug_out['bcs']
 
 
             out = {
-                'patient_id': dentition_data_dict['patient_id'], 
+                'patient_id': dentition_data_dict['patient_id'],
                 'dentition_points': th.from_numpy(dentition_arr_norm).transpose(1,2).float(),
-                # Auxiliary condition
-                # 'bounds_cyl':th.from_numpy(np.concatenate([bounds_cyl_c_arr_norm, bounds_cyl_s_arr_norm], 1)).float()
+                'fdi_indices': th.tensor(fdi_list, dtype=th.long),  # NEW: (28,) actual FDI numbers
+                # 'bounds_cyl': th.from_numpy(np.concatenate([bounds_cyl_c_arr_norm, bounds_cyl_s_arr_norm], 1)).float(),
+                'original_missing_mask': th.from_numpy(np.array(original_missing_mask)).bool()
             }
         except:
             print('PATIENT_ID', patient_id)

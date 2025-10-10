@@ -25,5 +25,6 @@ data
 ## Training
 ```
 python3 train_generation.py --bs [] --workers [] --niter []
+python3 train_generation.py --bs 8 --workers 8 --niter 10000
 
 ```
