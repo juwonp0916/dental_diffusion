@@ -18,7 +18,7 @@ from utils.file_utils import *
 from utils.visualize import *
 from model.pvcnn_generation import PVCNN2Base
 import torch.distributed as dist
-from datasets.dataset_generation import ToothDataset
+from datasets.dataset_generation import ToothDataset, FDIS
 from datasets.augmentation_techniques import *
 from torchvision import transforms
 import json
@@ -344,7 +344,11 @@ class Model(nn.Module):
         assert xt.dtype == torch.float
         assert t.shape == torch.Size([B]) and t.dtype == torch.int64
 
-        out, attn_mask = self.model(xt, t, **model_kwargs)
+        # Extract fdi_indices as positional argument (required by new model signature)
+        fdi_indices = model_kwargs['fdi_indices']
+        out, attn_mask = self.model(xt, t, model_kwargs['x0'], fdi_indices,
+                                     model_kwargs['l_mask'], model_kwargs['o_mask'],
+                                     model_kwargs.get('bound'))
 
         return out, attn_mask
 
@@ -376,6 +380,51 @@ class Model(nn.Module):
 
     def multi_gpu_wrapper(self, f):
         self.model = f(self.model)
+
+def validate_training_scenario(latent_mask, obs_mask, original_missing_mask, batch_idx, logger):
+    """
+    Validate that the training scenario is realistic:
+    1. We're not trying to reconstruct naturally missing teeth
+    2. We have sufficient context teeth for meaningful training
+    3. The latent and observation masks are consistent
+    """
+    B = latent_mask.shape[0]
+
+    for b in range(B):
+        # Check 1: Ensure latent teeth were originally present
+        if original_missing_mask is not None:
+            latent_indices = torch.where(latent_mask[b, :, 0, 0] == 1)[0]
+            originally_missing_indices = torch.where(original_missing_mask[b])[0]
+
+            invalid_latent = torch.isin(latent_indices, originally_missing_indices)
+            if torch.any(invalid_latent):
+                invalid_count = torch.sum(invalid_latent).item()
+                if logger:
+                    logger.warning(f"Batch {batch_idx}, sample {b}: Trying to reconstruct {invalid_count} naturally missing teeth")
+                return False
+
+        # Check 2: Ensure we have sufficient context teeth
+        obs_count = torch.sum(obs_mask[b, :, 0, 0]).item()
+        latent_count = torch.sum(latent_mask[b, :, 0, 0]).item()
+
+        if obs_count < 2:  # Need at least 2 context teeth
+            if logger:
+                logger.warning(f"Batch {batch_idx}, sample {b}: Insufficient context teeth ({obs_count})")
+            return False
+
+        if latent_count == 0:  # Need at least 1 tooth to reconstruct
+            if logger:
+                logger.warning(f"Batch {batch_idx}, sample {b}: No teeth to reconstruct")
+            return False
+
+        # Check 3: Ensure masks are consistent (no overlap)
+        overlap = torch.sum(latent_mask[b, :, 0, 0] * obs_mask[b, :, 0, 0]).item()
+        if overlap > 0:
+            if logger:
+                logger.warning(f"Batch {batch_idx}, sample {b}: Latent and observation masks overlap")
+            return False
+
+    return True
 
 def get_betas(schedule_type, b_start, b_end, time_num):
     if schedule_type == 'linear':
@@ -445,7 +494,7 @@ def get_dataloader(opt, dataset, local_rank, mode = 'train'):
                                                 shuffle=sampler is None, 
                                                 num_workers=int(opt.workers),
                                                 pin_memory = False,
-                                                persistent_workers = True,
+                                                persistent_workers = False,  # Reduced memory usage
                                                 drop_last=False)
     
     return dataloader, sampler
@@ -456,27 +505,58 @@ def generate_val_samples(opt, model, val_dataset, outf_syn, epoch, device):
 
     model.eval()
 
-    sample_batch_size = 1 # how many validation samples to generate 
+    sample_batch_size = 1 # how many validation samples to generate
     val_sample_list = val_dataset.sample_patient(sample_batch_size)
     val_dentition_points = torch.stack([sample['dentition_points'] for sample in val_sample_list], 0).to(device)
-    val_bound = torch.stack([sample['bounds_cyl'] for sample in val_sample_list], 0).to(device)
+    val_fdi_indices = torch.stack([sample['fdi_indices'] for sample in val_sample_list], 0).to(device)  # NEW
+    val_bound = None
+    if 'bounds_cyl' in val_sample_list[0]:
+        val_bound = torch.stack([sample['bounds_cyl'] for sample in val_sample_list], 0).to(device)
     val_dentition_ids = [sample['patient_id'] for sample in val_sample_list]
+
+    # Handle original missing teeth in validation
+    val_original_missing_mask = None
+    if 'original_missing_mask' in val_sample_list[0]:
+        val_original_missing_mask = torch.stack([sample['original_missing_mask'] for sample in val_sample_list], 0).to(device)
 
     latent_mask_val = torch.zeros_like(val_dentition_points[:,:,:1,:1]).to(device)
 
     for i in range(sample_batch_size):
-        n_missing_val = random.randint(1, opt.max_missing_teeth)
-        # TODO 
-        # 1. What if some teeth are already missing to begin with? (X assume all 28 teeth are present in the training dentition)
-        # 2. We want to avoid selecting wisdom teeth (FDI ~8) for simulating missing teeth 
-        missing_indices_val = torch.randperm(28)[:n_missing_val]
-    
-        latent_mask_val[i, missing_indices_val, 0, 0] = 1
+        # Get existing teeth for validation sampling
+        if val_original_missing_mask is not None:
+            existing_teeth_indices = torch.where(~val_original_missing_mask[i])[0]
+        else:
+            existing_teeth_indices = torch.arange(val_dentition_points.shape[1], device=device)
+
+        if len(existing_teeth_indices) == 0:
+            continue  # Skip if no teeth exist
+
+        # Select fewer teeth for validation to get cleaner results
+        n_missing_val = min(random.randint(1, min(3, opt.max_missing_teeth)), len(existing_teeth_indices))
+
+        # Prefer non-wisdom teeth for validation as well
+        non_wisdom_existing = []
+        for idx in existing_teeth_indices:
+            fdi = FDIS[idx] if idx < len(FDIS) else 0
+            if fdi % 10 != 8:  # Not a wisdom tooth
+                non_wisdom_existing.append(idx)
+
+        if len(non_wisdom_existing) >= n_missing_val:
+            selected_existing = torch.tensor(non_wisdom_existing, device=device)[torch.randperm(len(non_wisdom_existing))[:n_missing_val]]
+        else:
+            selected_existing = existing_teeth_indices[torch.randperm(len(existing_teeth_indices))[:n_missing_val]]
+
+        latent_mask_val[i, selected_existing, 0, 0] = 1
 
     obs_mask_val = torch.ones_like(latent_mask_val) - latent_mask_val
 
+    # Ensure we don't try to observe naturally missing teeth in validation
+    if val_original_missing_mask is not None:
+        obs_mask_val = obs_mask_val * (~val_original_missing_mask.unsqueeze(-1).unsqueeze(-1))
+
     val_data_dict = {
         'x0': val_dentition_points,
+        'fdi_indices': val_fdi_indices,  # NEW: Pass actual FDI numbers
         'l_mask': latent_mask_val,
         'o_mask':obs_mask_val,
         'bound':val_bound
@@ -557,7 +637,10 @@ def train(local_rank, opt, output_dir):
     torch.cuda.set_device(local_rank)
     device = torch.device('cuda', local_rank)
 
-
+    # Memory optimization settings
+    torch.cuda.empty_cache()
+    if hasattr(torch.cuda, 'set_per_process_memory_fraction'):
+        torch.cuda.set_per_process_memory_fraction(0.9)
 
     model = model.to(device)
 
@@ -598,26 +681,60 @@ def train(local_rank, opt, output_dir):
 
         
         for i, data in enumerate(dataloader):
-            
+
             dentition_points = data['dentition_points'].to(device) # (b, K, 3, 1024)
-            bound = data['bounds_cyl'].to(device) #(b, 28, 5)
+            fdi_indices = data['fdi_indices'].to(device)  # NEW: (b, 28) actual FDI numbers
+            bound = data.get('bounds_cyl')  # Optional, may not be in dataset
+            if bound is not None:
+                bound = bound.to(device)  # (b, 28, 5)
+            original_missing_mask = data['original_missing_mask'].to(device) if 'original_missing_mask' in data else None
             B, nT, nD, nP = dentition_points.shape
-            
+
             latent_mask = torch.zeros_like(dentition_points[:,:,:1,:1]).to(device)
 
             for b in range(B):
-                # Randomly select the number of missing teeth
-                n_missing = random.randint(1, opt.max_missing_teeth)
-                
-                # IMPORTANT, randomly select teeth to "Omit" for simulation
-                missing_indices = torch.randperm(28)[:n_missing]
-                # TODO 
-                # 1. What if some teeth are already missing to begin with? (X assume all 28 teeth are present in the training dentition)
-                # 2. We want to avoid selecting wisdom teeth FDI ~8 for simulating missing teeth 
+                # Get existing teeth for this batch item
+                if original_missing_mask is not None:
+                    existing_teeth_indices = torch.where(~original_missing_mask[b])[0]
+                else:
+                    # Fallback: assume all teeth exist (legacy behavior)
+                    existing_teeth_indices = torch.arange(nT, device=device)
 
-                latent_mask[b, missing_indices, 0, 0] = 1
+                if len(existing_teeth_indices) == 0:
+                    continue  # Skip if no teeth exist
+
+                # Randomly select number of teeth to simulate as missing from existing teeth only
+                n_missing = min(random.randint(1, opt.max_missing_teeth), len(existing_teeth_indices))
+
+                # Select random subset of existing teeth to simulate as missing
+                selected_existing = existing_teeth_indices[torch.randperm(len(existing_teeth_indices))[:n_missing]]
+
+                # Avoid selecting wisdom teeth (FDI ending in 8) for simulation if possible
+                non_wisdom_existing = []
+                wisdom_existing = []
+                for idx in existing_teeth_indices:
+                    fdi = FDIS[idx] if idx < len(FDIS) else 0
+                    if fdi % 10 == 8:  # Wisdom tooth (ends in 8)
+                        wisdom_existing.append(idx)
+                    else:
+                        non_wisdom_existing.append(idx)
+
+                # Prefer selecting non-wisdom teeth for simulation
+                if len(non_wisdom_existing) >= n_missing:
+                    selected_existing = torch.tensor(non_wisdom_existing, device=device)[torch.randperm(len(non_wisdom_existing))[:n_missing]]
+
+                latent_mask[b, selected_existing, 0, 0] = 1
 
             obs_mask = torch.ones_like(latent_mask) - latent_mask
+
+            # Ensure we don't try to observe naturally missing teeth
+            if original_missing_mask is not None:
+                # Set obs_mask to 0 for naturally missing teeth
+                obs_mask = obs_mask * (~original_missing_mask.unsqueeze(-1).unsqueeze(-1))
+
+            # Validate training scenario before proceeding
+            if not validate_training_scenario(latent_mask, obs_mask, original_missing_mask, i, logger if take_action else None):
+                continue  # Skip this batch if validation fails
 
             # IMPORTANT
             # obs_mask (observed mask): mask that indicates which teeth are existing context teeth
@@ -627,6 +744,7 @@ def train(local_rank, opt, output_dir):
 
             data_dict = {
                 'x0': dentition_points,
+                'fdi_indices': fdi_indices,  # NEW: Pass actual FDI numbers
                 'l_mask': latent_mask,
                 'o_mask':obs_mask,
                 'bound':bound
@@ -637,6 +755,10 @@ def train(local_rank, opt, output_dir):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
+            # Clear memory after each batch
+            if i % 5 == 0:  # Clear cache every 5 batches
+                torch.cuda.empty_cache()
 
             # Print progress
             if i % opt.print_freq == 0 and take_action:
@@ -708,7 +830,7 @@ def parse_args():
 
     # Input point cloud
     parser.add_argument('--nc', type=int, default=3, help="dimension of one point (usually 3 for x, y,z)")
-    parser.add_argument('--extra_feature_nc', type=int, default=9, help="1 for binary mask between context&target, and 8 for FDI embedding")
+    parser.add_argument('--extra_feature_nc', type=int, default=8, help="1 for binary mask + 7 for deterministic FDI encoding (jaw/quadrant/position)")
 
     parser.add_argument('--max_missing_teeth', type=int, default=6, help="maximum missing teeth to simulate") 
     parser.add_argument('--tooth_npoints', type=int, default=1024, help="num points per toorh") 
