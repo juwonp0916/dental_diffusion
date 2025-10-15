@@ -18,7 +18,7 @@ from utils.file_utils import *
 from utils.visualize import *
 from model.pvcnn_generation import PVCNN2Base
 import torch.distributed as dist
-from datasets.dataset_generation import ToothDataset, FDIS
+from datasets.dataset_generation import ToothDataset, FDIS, FDI_TO_IDX, IDX_TO_FDI
 from datasets.augmentation_techniques import *
 from torchvision import transforms
 import json
@@ -260,17 +260,28 @@ class GaussianDiffusion:
     def mse_mean_flat(self, B, noise, eps_recon, mask):
         """
         Take the mean over all non-batch dimensions, considering only unmasked elements.
+
+        Args:
+            noise: (B, 28, 3, 1024) - ground truth noise
+            eps_recon: (B, 28, 3, 1024) - predicted noise
+            mask: (B, 28, 1, 1) - latent mask indicating which teeth to reconstruct
         """
-        total_loss = 0
+        # Expand mask to match noise dimensions: (B, 28, 1, 1) -> (B, 28, 3, 1024)
+        mask_expanded = mask.expand_as(noise)  # (B, 28, 3, 1024)
 
-        for b in range(B):
+        # Apply mask and compute MSE only on latent teeth
+        masked_diff = (noise - eps_recon) * mask_expanded
 
-            gt_noise = noise[b][mask[b].view(-1).bool()]
-            pred_noise = eps_recon[b][mask[b].view(-1).bool()]
-            loss_b = ((gt_noise - pred_noise)**2).mean()
-            total_loss = total_loss + loss_b
+        # Sum over all dimensions and normalize by number of masked elements
+        num_masked_elements = mask_expanded.sum()
 
-        return total_loss / B
+        if num_masked_elements == 0:
+            # No latent teeth to reconstruct - return zero loss
+            return torch.tensor(0.0, device=noise.device, requires_grad=True)
+
+        loss = (masked_diff ** 2).sum() / num_masked_elements
+
+        return loss
 
     def p_losses(self, denoise_fn, t, noise, model_kwargs):
         
@@ -344,11 +355,12 @@ class Model(nn.Module):
         assert xt.dtype == torch.float
         assert t.shape == torch.Size([B]) and t.dtype == torch.int64
 
-        # Extract fdi_indices as positional argument (required by new model signature)
+        # Extract fdi_indices (embedding indices [0-27]) as positional argument
         fdi_indices = model_kwargs['fdi_indices']
         out, attn_mask = self.model(xt, t, model_kwargs['x0'], fdi_indices,
                                      model_kwargs['l_mask'], model_kwargs['o_mask'],
-                                     model_kwargs.get('bound'))
+                                     model_kwargs.get('bound'),
+                                     model_kwargs.get('original_missing_mask'))
 
         return out, attn_mask
 
@@ -508,7 +520,7 @@ def generate_val_samples(opt, model, val_dataset, outf_syn, epoch, device):
     sample_batch_size = 1 # how many validation samples to generate
     val_sample_list = val_dataset.sample_patient(sample_batch_size)
     val_dentition_points = torch.stack([sample['dentition_points'] for sample in val_sample_list], 0).to(device)
-    val_fdi_indices = torch.stack([sample['fdi_indices'] for sample in val_sample_list], 0).to(device)  # NEW
+    val_fdi_indices = torch.stack([sample['fdi_indices'] for sample in val_sample_list], 0).to(device)  # Embedding indices [0-27]
     val_bound = None
     if 'bounds_cyl' in val_sample_list[0]:
         val_bound = torch.stack([sample['bounds_cyl'] for sample in val_sample_list], 0).to(device)
@@ -556,10 +568,11 @@ def generate_val_samples(opt, model, val_dataset, outf_syn, epoch, device):
 
     val_data_dict = {
         'x0': val_dentition_points,
-        'fdi_indices': val_fdi_indices,  # NEW: Pass actual FDI numbers
+        'fdi_indices': val_fdi_indices,  # Embedding indices [0-27]
         'l_mask': latent_mask_val,
         'o_mask':obs_mask_val,
-        'bound':val_bound
+        'bound':val_bound,
+        'original_missing_mask': val_original_missing_mask  # For attention masking
     }
 
     # generate some samples
@@ -640,7 +653,16 @@ def train(local_rank, opt, output_dir):
     # Memory optimization settings
     torch.cuda.empty_cache()
     if hasattr(torch.cuda, 'set_per_process_memory_fraction'):
-        torch.cuda.set_per_process_memory_fraction(0.9)
+        torch.cuda.set_per_process_memory_fraction(0.85)  # Reduced from 0.9 to leave more headroom
+
+    # Fix memory fragmentation by limiting block size
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,expandable_segments:True'
+
+    if take_action:
+        logger.info('Memory optimization settings applied:')
+        logger.info(f'  - CUDA device: {local_rank}')
+        logger.info(f'  - Memory fraction: 0.85')
+        logger.info(f'  - Max split size: 128MB')
 
     model = model.to(device)
 
@@ -664,7 +686,7 @@ def train(local_rank, opt, output_dir):
 
     def _transform_(m):
         return nn.parallel.DistributedDataParallel(
-            m, device_ids=[local_rank], output_device=local_rank)
+            m, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
 
     model.multi_gpu_wrapper(_transform_)
 
@@ -683,7 +705,7 @@ def train(local_rank, opt, output_dir):
         for i, data in enumerate(dataloader):
 
             dentition_points = data['dentition_points'].to(device) # (b, K, 3, 1024)
-            fdi_indices = data['fdi_indices'].to(device)  # NEW: (b, 28) actual FDI numbers
+            fdi_indices = data['fdi_indices'].to(device)  # (b, 28) embedding indices [0-27]
             bound = data.get('bounds_cyl')  # Optional, may not be in dataset
             if bound is not None:
                 bound = bound.to(device)  # (b, 28, 5)
@@ -744,21 +766,53 @@ def train(local_rank, opt, output_dir):
 
             data_dict = {
                 'x0': dentition_points,
-                'fdi_indices': fdi_indices,  # NEW: Pass actual FDI numbers
+                'fdi_indices': fdi_indices,  # Embedding indices [0-27]
                 'l_mask': latent_mask,
                 'o_mask':obs_mask,
-                'bound':bound
+                'bound':bound,
+                'original_missing_mask': original_missing_mask  # For attention masking
             }
             loss = model.get_loss_iter_teethmask(noise_batch, model_kwargs=data_dict)
+
+            # Check for NaN loss immediately
+            if torch.isnan(loss) or torch.isinf(loss):
+                if take_action:
+                    logger.error(f"[{epoch:>3d}/{opt.niter:>3d}][{i:>3d}/{len(dataloader):>3d}] NaN/Inf loss detected! Skipping batch.")
+                    logger.error(f"   dentition_points range: [{dentition_points.min().item():.4f}, {dentition_points.max().item():.4f}]")
+                    logger.error(f"   noise_batch range: [{noise_batch.min().item():.4f}, {noise_batch.max().item():.4f}]")
+                    logger.error(f"   latent_mask sum: {latent_mask.sum().item()}")
+                    logger.error(f"   obs_mask sum: {obs_mask.sum().item()}")
+                continue  # Skip this batch
 
             # Optimize network parameters
             optimizer.zero_grad()
             loss.backward()
+
+            # Gradient clipping to prevent NaN
+            if opt.grad_clip is not None and opt.grad_clip > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), opt.grad_clip)
+                if take_action and i % opt.print_freq == 0:
+                    logger.info(f'   Gradient norm: {grad_norm.item():.4f}')
+
+            # Check for NaN gradients
+            has_nan_grad = False
+            for name, param in model.named_parameters():
+                if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                    if take_action:
+                        logger.error(f"   NaN/Inf gradient in {name}")
+                    has_nan_grad = True
+                    break
+
+            if has_nan_grad:
+                if take_action:
+                    logger.error(f"[{epoch:>3d}/{opt.niter:>3d}][{i:>3d}/{len(dataloader):>3d}] NaN/Inf gradients detected! Skipping optimizer step.")
+                optimizer.zero_grad()  # Clear bad gradients
+                continue  # Skip optimizer step
+
             optimizer.step()
 
-            # Clear memory after each batch
-            if i % 5 == 0:  # Clear cache every 5 batches
-                torch.cuda.empty_cache()
+            # Clear memory after EVERY batch to prevent OOM
+            torch.cuda.empty_cache()
 
             # Print progress
             if i % opt.print_freq == 0 and take_action:
@@ -830,7 +884,7 @@ def parse_args():
 
     # Input point cloud
     parser.add_argument('--nc', type=int, default=3, help="dimension of one point (usually 3 for x, y,z)")
-    parser.add_argument('--extra_feature_nc', type=int, default=8, help="1 for binary mask + 7 for deterministic FDI encoding (jaw/quadrant/position)")
+    parser.add_argument('--extra_feature_nc', type=int, default=10, help="8 for positional embedding + 1 for obs_mask + 1 for tooth_exists_mask")
 
     parser.add_argument('--max_missing_teeth', type=int, default=6, help="maximum missing teeth to simulate") 
     parser.add_argument('--tooth_npoints', type=int, default=1024, help="num points per toorh") 
