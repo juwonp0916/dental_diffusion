@@ -1,12 +1,20 @@
 # IMPORTANT: Requires Python 3.11 (NOT 3.12 or 3.13)
 # Open3D does not support Python 3.12+ yet
 #
-# Install PyTorch separately with CUDA support:
-# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-# Or for latest CUDA 12.4: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# CRITICAL: PyTorch 2.5.x has breaking C++ API changes that prevent CUDA extensions from compiling
+# You MUST use PyTorch 2.1.x for compatibility with the PVCNN CUDA kernels
+#
+# Install PyTorch 2.1.2 with CUDA 11.8 support:
+# pip install torch==2.1.2 torchvision==0.16.2 --index-url https://download.pytorch.org/whl/cu118
+#
+# For CUDA 12.1:
+# pip install torch==2.1.2 torchvision==0.16.2 --index-url https://download.pytorch.org/whl/cu121
+#
+# CRITICAL: NumPy 2.x is incompatible with PyTorch 2.1.2
+# You MUST use NumPy 1.x (1.24.x is recommended for Python 3.11 + PyTorch 2.1.2)
 
 matplotlib==3.10.3
-numpy==2.3.1
+numpy<2.0,>=1.24.0
 tqdm==4.67.1
 trimesh==4.6.2
 pynrrd==1.1.3

@@ -8,6 +8,76 @@ from glob import glob
 # TODO we want to include wisdom teeth as well. BUT only as context teeth.
 FDIS=[17,47,16,46,15,45,14,44,13,43,12,42,11,41,21,31,22,32,23,33,24,34,25,35,26,36,27,37]
 
+# FDI to embedding index mapping
+# CRITICAL: Index 0 is reserved for missing teeth, real teeth use indices 1-28
+# Upper right (11-17) -> indices 1-7
+# Upper left (21-27) -> indices 8-14
+# Lower left (31-37) -> indices 15-21
+# Lower right (41-47) -> indices 22-28
+def create_fdi_to_idx_mapping():
+    """
+    Create mapping from FDI tooth numbers to embedding indices [1-28].
+    Index 0 is RESERVED for missing teeth to avoid conflicts.
+    FDI numbering: 11-17 (upper right), 21-27 (upper left), 31-37 (lower left), 41-47 (lower right)
+    Mapping: 11-17 -> 1-7, 21-27 -> 8-14, 31-37 -> 15-21, 41-47 -> 22-28
+    """
+    fdi_to_idx = {}
+
+    # Upper right quadrant: 11-17 -> 1-7 (shifted by 1)
+    for i in range(7):
+        fdi_to_idx[11 + i] = i + 1
+
+    # Upper left quadrant: 21-27 -> 8-14 (shifted by 1)
+    for i in range(7):
+        fdi_to_idx[21 + i] = 8 + i
+
+    # Lower left quadrant: 31-37 -> 15-21 (shifted by 1)
+    for i in range(7):
+        fdi_to_idx[31 + i] = 15 + i
+
+    # Lower right quadrant: 41-47 -> 22-28 (shifted by 1)
+    for i in range(7):
+        fdi_to_idx[41 + i] = 22 + i
+
+    # 0 (missing tooth indicator) maps to 0
+    fdi_to_idx[0] = 0
+
+    return fdi_to_idx
+
+def create_idx_to_fdi_mapping():
+    """Create reverse mapping from embedding indices to FDI numbers."""
+    idx_to_fdi = {}
+
+    # Upper right quadrant: 0-6 -> 11-17
+    for i in range(7):
+        idx_to_fdi[i] = 11 + i
+
+    # Upper left quadrant: 7-13 -> 21-27
+    for i in range(7):
+        idx_to_fdi[7 + i] = 21 + i
+
+    # Lower left quadrant: 14-20 -> 31-37
+    for i in range(7):
+        idx_to_fdi[14 + i] = 31 + i
+
+    # Lower right quadrant: 21-27 -> 41-47
+    for i in range(7):
+        idx_to_fdi[21 + i] = 41 + i
+
+    return idx_to_fdi
+
+# Global mappings
+FDI_TO_IDX = create_fdi_to_idx_mapping()
+IDX_TO_FDI = create_idx_to_fdi_mapping()
+
+def fdi_to_embedding_idx(fdi_number):
+    """Convert FDI tooth number to embedding index [0-27]."""
+    return FDI_TO_IDX.get(fdi_number, 0)
+
+def embedding_idx_to_fdi(idx):
+    """Convert embedding index [0-27] to FDI tooth number."""
+    return IDX_TO_FDI.get(idx, 0)
+
 
 class ToothDataset(th.utils.data.Dataset):
     def __init__(self, 
@@ -175,7 +245,8 @@ class ToothDataset(th.utils.data.Dataset):
                     vert = dentition_data_dict['data'][fdi]
                     random_index = np.random.randint(0, vert.shape[0], self.tooth_npoints)
                     dentition_arr.append(vert[random_index])
-                    fdi_list.append(fdi)  # NEW: Store actual FDI number
+                    # Convert FDI number to embedding index [0-27]
+                    fdi_list.append(fdi_to_embedding_idx(fdi))
                     # bounds_cyl_c_arr.append(dentition_data_dict['bounds'][fdi]['center'])
                     # bounds_cyl_s_arr.append(dentition_data_dict['bounds'][fdi]['size'])
                     original_missing_mask.append(False)  # Tooth exists
@@ -183,7 +254,8 @@ class ToothDataset(th.utils.data.Dataset):
                     # Tooth is naturally missing, fill with small random noise
                     noise = np.random.normal(loc=0.0, scale=0.05, size=(self.tooth_npoints, 3))
                     dentition_arr.append(noise)
-                    fdi_list.append(0)  # NEW: 0 indicates missing tooth
+                    # 0 indicates missing tooth (maps to embedding index 0)
+                    fdi_list.append(0)
                     # Use zero bounds for missing teeth
                     # bounds_cyl_c_arr.append(np.zeros(3))
                     # bounds_cyl_s_arr.append(np.zeros(2))
@@ -198,6 +270,13 @@ class ToothDataset(th.utils.data.Dataset):
             # assert bounds_cyl_s_arr.shape == (len(FDIS), 2)
 
             dentition_arr_norm, existing_teeth_mask = self.normalize_dentition(dentition_arr)
+
+            # CRITICAL FIX: Fill naturally missing teeth with small noise AFTER normalization
+            # This ensures missing teeth have near-zero values in the normalized space
+            for tooth_idx in range(len(FDIS)):
+                if original_missing_mask[tooth_idx]:
+                    # Replace with small noise in normalized space
+                    dentition_arr_norm[tooth_idx] = np.random.normal(loc=0.0, scale=0.01, size=(self.tooth_npoints, 3))
             # dentition_arr_norm, bounds_cyl_c_arr_norm, bounds_cyl_s_arr_norm = self.normalize_dentition(dentition_arr,
             #                                                                                             bounds_cyl_c_arr,
             #                                                                                             bounds_cyl_s_arr)
@@ -214,7 +293,7 @@ class ToothDataset(th.utils.data.Dataset):
             out = {
                 'patient_id': dentition_data_dict['patient_id'],
                 'dentition_points': th.from_numpy(dentition_arr_norm).transpose(1,2).float(),
-                'fdi_indices': th.tensor(fdi_list, dtype=th.long),  # NEW: (28,) actual FDI numbers
+                'fdi_indices': th.tensor(fdi_list, dtype=th.long),  # (28,) embedding indices [0-27]
                 # 'bounds_cyl': th.from_numpy(np.concatenate([bounds_cyl_c_arr_norm, bounds_cyl_s_arr_norm], 1)).float(),
                 'original_missing_mask': th.from_numpy(np.array(original_missing_mask)).bool()
             }

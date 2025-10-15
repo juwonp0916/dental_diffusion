@@ -3,62 +3,10 @@ import time
 import math
 import torch.nn as nn
 import torch
-import torch.nn.functional as F
 import numpy as np
+from torch.utils.checkpoint import checkpoint
 from modules import SharedMLP, PVConv, PointNetSAModule, PointNetAModule, PointNetFPModule, Attention, Swish
 from model import Transformer, LayerNorm
-
-def create_fdi_encoding(fdi):
-    """
-    Create 7-dim deterministic encoding from FDI number.
-
-    FDI numbering:
-    - Quadrant 1 (upper right): 11-17
-    - Quadrant 2 (upper left): 21-27
-    - Quadrant 3 (lower left): 31-37
-    - Quadrant 4 (lower right): 41-47
-
-    Returns 7-dim encoding:
-    - Dim 0: Jaw indicator (0=upper [1x,2x], 1=lower [3x,4x])
-    - Dims 1-4: Quadrant one-hot (Q1, Q2, Q3, Q4)
-    - Dim 5: Position within quadrant (0-1 normalized for positions 1-8)
-    - Dim 6: Reserved for future use
-
-    Args:
-        fdi: FDI tooth number (11-47), or 0 for missing tooth
-
-    Returns:
-        torch.Tensor: 7-dim encoding vector
-
-    The purpose of this encoding to is provide better context to the model. 
-    While the FDI itself could directly be supplied inside the encoding, but then
-    the model would need to learn the meaning of the FDI numbers, hence the quadrant
-    and position value was supplied explicitly. 
-    """
-    if fdi == 0:  # Missing tooth
-        return torch.zeros(7)
-
-    quadrant = fdi // 10  # Extract quadrant (1, 2, 3, 4)
-    position = fdi % 10   # Extract position (1-8)
-
-    # Jaw: 0=upper (quadrants 1,2), 1=lower (quadrants 3,4)
-    jaw = 0.0 if quadrant in [1, 2] else 1.0
-
-    # Quadrant one-hot encoding
-    quad_onehot = F.one_hot(torch.tensor(quadrant - 1), num_classes=4).float()
-
-    # Normalize position to [0, 1] range (positions 1-8 → 0.0-1.0)
-    pos_norm = (position - 1) / 7.0
-
-    # Concatenate all components
-    encoding = torch.cat([
-        torch.tensor([jaw]),      # Dim 0: Jaw indicator
-        quad_onehot,              # Dims 1-4: Quadrant one-hot
-        torch.tensor([pos_norm]), # Dim 5: Normalized position
-        torch.zeros(1)            # Dim 6: Reserved
-    ])
-
-    return encoding
 
 def _linear_gn_relu(in_channels, out_channels):
     return nn.Sequential(nn.Linear(in_channels, out_channels), nn.GroupNorm(8, out_channels), Swish())
@@ -230,18 +178,20 @@ def create_pointnet2_fp_modules(fp_blocks, in_channels, sa_in_channels, embed_di
 
     return fp_layers, in_channels
 
-
 class PVCNN2Base(nn.Module):
 
     def __init__(self, num_classes, embed_dim, use_att, dropout=0.1,
-                 extra_feature_channels=8, width_multiplier=1, voxel_resolution_multiplier=1):
+                 extra_feature_channels=3, width_multiplier=1, voxel_resolution_multiplier=1,
+                 use_checkpoint=True):
         super().__init__()
         assert extra_feature_channels >= 0
         self.embed_dim = embed_dim
         self.extra_feature_channels = extra_feature_channels
         self.in_channels = extra_feature_channels + 3
+        self.use_checkpoint = use_checkpoint  # Enable gradient checkpointing to save memory
 
-        #No more ebedding to uniquely identify FDI
+        # embedding to uniquely identify fdi
+        self.fdi_embedding = nn.Embedding(num_embeddings=28, embedding_dim=8)
 
         sa_layers, sa_in_channels, channels_sa_features, _ = create_pointnet2_sa_components(
             sa_blocks=self.sa_blocks, extra_feature_channels=extra_feature_channels, with_se=True, embed_dim=embed_dim,
@@ -272,6 +222,19 @@ class PVCNN2Base(nn.Module):
                                     nn.Linear(embed_dim, embed_dim))
         
 
+
+        self.bound_embedding = nn.Linear(5, embed_dim)
+
+        self.bound_transformer = Transformer(
+            n_ctx=28,
+            width = embed_dim,
+            layers = 4,
+            heads = 8
+        )
+
+        self.bound_final_ln = LayerNorm(embed_dim)
+
+
     def get_timestep_embedding(self, timesteps, device):
 
         half_dim = self.embed_dim // 2
@@ -287,66 +250,103 @@ class PVCNN2Base(nn.Module):
         return emb
 
 
-    def forward(self, xt, t, x0, fdi_indices, l_mask, o_mask, bound=None):
+    def forward(self, xt, t, x0, fdi_indices, l_mask, o_mask, bound, original_missing_mask=None):
 
         # xt: (B, 28, 3, 1024)
         # x0: (B, 28, 3, 1024)
-        # fdi_indices: (B, 28) - actual FDI numbers for each tooth
+        # fdi_indices: (B, 28) - embedding indices [0-27] or 0 for missing teeth
         # o_mask: (B, 28, 1, 1)
         # l_mask: (B, 28, 1, 1)
-        # bound (B, 28, 5)
+        # bound (B, 28, 5) or None
+        # original_missing_mask: (B, 28) - True for naturally missing teeth
 
         B, nT, nD, nP = xt.shape
         t = t.view(B, 1).expand(B, nT).reshape(B*nT)
 
-        # Create deterministic 7-dim FDI encodings from actual FDI indices
-        fdi_encodings = torch.stack([
-            create_fdi_encoding(fdi.item())
-            for fdi in fdi_indices.view(-1)
-        ]).reshape(B, nT, 7).to(xt.device)  # (B, 28, 7)
+        # Create attention mask for global attention from original_missing_mask
+        # Shape: (B*28,) - True for positions to mask out in attention
+        if original_missing_mask is not None:
+            # Expand from (B, 28) to (B*28,) by flattening
+            attn_mask = original_missing_mask.reshape(B*nT)
+        else:
+            attn_mask = None
 
-        frame_indices = torch.arange(nT, device=x0.device).unsqueeze(0).repeat(B,1)
+        # Use the actual FDI embedding indices passed from dataset (already mapped [0-27])
+        fdi_embeddings = self.fdi_embedding(fdi_indices) # (B, 28, 8)
 
+        # Handle missing bounding cylinder data
+        # Instead of using zero bounds (which cause numerical instability in transformer),
+        # use learned positional embeddings or skip the bound transformer entirely
         temb_raw = self.embedf(self.get_timestep_embedding(t, xt.device))
+
+        if bound is not None:
+            # Only use bound transformer when actual bound data is available
+            bound_embedding = self.bound_embedding(bound)
+            bound_embedding_transformed = self.bound_transformer(bound_embedding)
+            bound_embedding_transformed = self.bound_final_ln(bound_embedding_transformed).reshape(B*nT, self.embed_dim)
+            temb_raw = temb_raw + bound_embedding_transformed
+        # else: Skip bound embedding when not available - use only timestep embedding
+
         temb = temb_raw[:, :, None].expand(-1, -1, xt.shape[-1])
 
-        obs_indicator = torch.ones_like(xt[:,:,:1,:]) * o_mask  # (B, 28, 1, 1024)
-        fdi_encodings = fdi_encodings.unsqueeze(3).repeat(1, 1, 1, nP) #(B, 28, 7, 1024)
+        # Create binary indicator: 1 if tooth naturally exists (fdi_indices > 0), 0 if missing (fdi_indices == 0)
+        # Note: fdi_indices contains embedding indices [0-27], with 0 indicating missing teeth
+        tooth_exists_mask = (fdi_indices > 0).float().unsqueeze(-1).unsqueeze(-1)  # (B, 28, 1, 1)
+
+        # Memory optimization: use expand instead of creating new tensors with ones_like
+        obs_indicator = o_mask.expand(-1, -1, 1, nP)  # (B, 28, 1, 1024) - no new memory allocation
+        fdi_embeddings = fdi_embeddings.unsqueeze(3).expand(-1, -1, -1, nP)  # (B, 28, 8, 1024) - use expand instead of repeat
+        tooth_exists_indicator = tooth_exists_mask.expand(-1, -1, 1, nP)  # (B, 28, 1, 1024) - no new memory allocation
 
         x = torch.cat([
             xt*l_mask + x0*o_mask,
-            fdi_encodings, #7
-            obs_indicator #1
+            fdi_embeddings,           # 8 channels - FDI-based positional embedding (tooth identity)
+            obs_indicator,            # 1 channel  - is this tooth used as context?
+            tooth_exists_indicator    # 1 channel  - does this tooth naturally exist in patient?
         ], dim=2)
-        
-        # x: (B, 28, (3+7+1), 1024) = (B, 28, 11, 1024)
+        # x: (B, 28, (3+8+1+1), 1024) = (B, 28, 13, 1024) 
         x = x.reshape(B*nT, nD+self.extra_feature_channels, nP)
 
         coords, features = x[:, :3, :].contiguous(), x
         coords_list, in_features_list = [], []
 
-        # Set abstraction layer
+        # Set abstraction layer with gradient checkpointing to save memory
         for i, sa_blocks in enumerate(self.sa_layers):  # 4 layers
             in_features_list.append(features)
             coords_list.append(coords)
 
-            if i == 0:
-                features, coords, temb = sa_blocks((features, coords, temb))
+            if self.use_checkpoint and self.training:
+                # Use gradient checkpointing during training to save memory
+                if i == 0:
+                    features, coords, temb = checkpoint(sa_blocks, (features, coords, temb), use_reentrant=False)
+                else:
+                    features, coords, temb = checkpoint(sa_blocks, (torch.cat([features, temb], dim=1), coords, temb), use_reentrant=False)
             else:
-                features, coords, temb = sa_blocks((torch.cat([features, temb], dim=1), coords, temb))
+                # Normal forward pass during evaluation
+                if i == 0:
+                    features, coords, temb = sa_blocks((features, coords, temb))
+                else:
+                    features, coords, temb = sa_blocks((torch.cat([features, temb], dim=1), coords, temb))
 
         in_features_list[0] = x[:, 3:, :].contiguous()
 
         if self.global_att is not None:
-            features = self.global_att(features)
+            if self.use_checkpoint and self.training:
+                # Pass attention mask through checkpoint
+                features = checkpoint(lambda *args: self.global_att(*args), features, attn_mask, use_reentrant=False)
+            else:
+                features = self.global_att(features, attn_mask)
   
-        # Feature propagation layer
+        # Feature propagation layer with gradient checkpointing
         for fp_idx, fp_blocks in enumerate(self.fp_layers):  # 4 layers
-            
+
             jump_coords = coords_list[-1 - fp_idx]
             fump_feats = in_features_list[-1 - fp_idx]
 
-            features, coords, temb = fp_blocks((jump_coords, coords, torch.cat([features, temb], dim=1), fump_feats, temb))
+            if self.use_checkpoint and self.training:
+                features, coords, temb = checkpoint(fp_blocks, (jump_coords, coords, torch.cat([features, temb], dim=1), fump_feats, temb), use_reentrant=False)
+            else:
+                features, coords, temb = fp_blocks((jump_coords, coords, torch.cat([features, temb], dim=1), fump_feats, temb))
 
         out = self.classifier(features)
 
@@ -354,4 +354,6 @@ class PVCNN2Base(nn.Module):
 
 
         return out, None
+
+
 
