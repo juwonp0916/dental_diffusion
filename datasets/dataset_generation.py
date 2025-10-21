@@ -9,38 +9,35 @@ from glob import glob
 FDIS=[17,47,16,46,15,45,14,44,13,43,12,42,11,41,21,31,22,32,23,33,24,34,25,35,26,36,27,37]
 
 # FDI to embedding index mapping
-# CRITICAL: Index 0 is reserved for missing teeth, real teeth use indices 1-28
-# Upper right (11-17) -> indices 1-7
-# Upper left (21-27) -> indices 8-14
-# Lower left (31-37) -> indices 15-21
-# Lower right (41-47) -> indices 22-28
+# Upper right (11-17) -> indices 0-6
+# Upper left (21-27) -> indices 7-13
+# Lower left (31-37) -> indices 14-20
+# Lower right (41-47) -> indices 21-27
+# Missing teeth use original_missing_mask for identification
 def create_fdi_to_idx_mapping():
     """
-    Create mapping from FDI tooth numbers to embedding indices [1-28].
-    Index 0 is RESERVED for missing teeth to avoid conflicts.
+    Create mapping from FDI tooth numbers to embedding indices [0-27].
     FDI numbering: 11-17 (upper right), 21-27 (upper left), 31-37 (lower left), 41-47 (lower right)
-    Mapping: 11-17 -> 1-7, 21-27 -> 8-14, 31-37 -> 15-21, 41-47 -> 22-28
+    Mapping: 11-17 -> 0-6, 21-27 -> 7-13, 31-37 -> 14-20, 41-47 -> 21-27
+    Note: We use ALL indices [0-27] for real teeth. Missing teeth are identified by the original_missing_mask.
     """
     fdi_to_idx = {}
 
-    # Upper right quadrant: 11-17 -> 1-7 (shifted by 1)
+    # Upper right quadrant: 11-17 -> 0-6
     for i in range(7):
-        fdi_to_idx[11 + i] = i + 1
+        fdi_to_idx[11 + i] = i
 
-    # Upper left quadrant: 21-27 -> 8-14 (shifted by 1)
+    # Upper left quadrant: 21-27 -> 7-13
     for i in range(7):
-        fdi_to_idx[21 + i] = 8 + i
+        fdi_to_idx[21 + i] = 7 + i
 
-    # Lower left quadrant: 31-37 -> 15-21 (shifted by 1)
+    # Lower left quadrant: 31-37 -> 14-20
     for i in range(7):
-        fdi_to_idx[31 + i] = 15 + i
+        fdi_to_idx[31 + i] = 14 + i
 
-    # Lower right quadrant: 41-47 -> 22-28 (shifted by 1)
+    # Lower right quadrant: 41-47 -> 21-27
     for i in range(7):
-        fdi_to_idx[41 + i] = 22 + i
-
-    # 0 (missing tooth indicator) maps to 0
-    fdi_to_idx[0] = 0
+        fdi_to_idx[41 + i] = 21 + i
 
     return fdi_to_idx
 
@@ -71,7 +68,32 @@ FDI_TO_IDX = create_fdi_to_idx_mapping()
 IDX_TO_FDI = create_idx_to_fdi_mapping()
 
 def fdi_to_embedding_idx(fdi_number):
-    """Convert FDI tooth number to embedding index [0-27]."""
+    """
+    Convert FDI tooth number to embedding index [0-27].
+
+    Key Design: All teeth (existing and missing) use their POSITIONAL embedding.
+    - Embedding tells the model WHERE a tooth is anatomically (e.g., FDI 17 → index 6)
+    - original_missing_mask tells the model IF the tooth exists (True = missing, False = present)
+    - tooth_exists_indicator channel in the model input also signals existence (0 = missing, 1 = present)
+
+    Example:
+        - FDI 17 is missing → Still gets embedding index 6 (its anatomical position)
+        - original_missing_mask[i] = True → Signals to model "this tooth doesn't exist"
+        - Model sees: position=6 (where it should be), exists=False (but it's not there)
+
+    This approach ensures:
+        1. No ambiguity - each position has a unique embedding index
+        2. Model knows spatial context even for missing teeth
+        3. Mask system (not embedding) handles existence
+
+    Args:
+        fdi_number: FDI tooth number from FDIS list (11-17, 21-27, 31-37, 41-47)
+
+    Returns:
+        Embedding index [0-27] for the tooth's anatomical position
+    """
+    # Direct lookup - in normal operation, fdi_number is always from FDIS list
+    # which contains only valid FDI numbers, so this will always succeed
     return FDI_TO_IDX.get(fdi_number, 0)
 
 def embedding_idx_to_fdi(idx):
@@ -241,25 +263,31 @@ class ToothDataset(th.utils.data.Dataset):
 
             for fdi in FDIS:
                 if fdi in dentition_data_dict['data']:
-                    # Tooth exists in dataset
+                    # CASE 1: Tooth exists in dataset
                     vert = dentition_data_dict['data'][fdi]
                     random_index = np.random.randint(0, vert.shape[0], self.tooth_npoints)
                     dentition_arr.append(vert[random_index])
-                    # Convert FDI number to embedding index [0-27]
-                    fdi_list.append(fdi_to_embedding_idx(fdi))
+                    fdi_list.append(fdi_to_embedding_idx(fdi))  # Positional embedding [0-27]
                     # bounds_cyl_c_arr.append(dentition_data_dict['bounds'][fdi]['center'])
                     # bounds_cyl_s_arr.append(dentition_data_dict['bounds'][fdi]['size'])
-                    original_missing_mask.append(False)  # Tooth exists
+                    original_missing_mask.append(False)  # Signals: tooth is PRESENT
                 else:
-                    # Tooth is naturally missing, fill with small random noise
+                    # CASE 2: Tooth is naturally missing
+                    # Fill with small noise (will be replaced with even smaller noise after normalization)
                     noise = np.random.normal(loc=0.0, scale=0.05, size=(self.tooth_npoints, 3))
                     dentition_arr.append(noise)
-                    # 0 indicates missing tooth (maps to embedding index 0)
-                    fdi_list.append(0)
+
+                    # IMPORTANT: Missing teeth ALSO get their positional embedding index
+                    # This tells the model WHERE the tooth should be anatomically
+                    # The mask (below) tells the model that it doesn't actually exist
+                    fdi_list.append(fdi_to_embedding_idx(fdi))  # Same positional embedding [0-27]
+
                     # Use zero bounds for missing teeth
                     # bounds_cyl_c_arr.append(np.zeros(3))
                     # bounds_cyl_s_arr.append(np.zeros(2))
-                    original_missing_mask.append(True)  # Tooth is missing
+
+                    # The mask signals to the model: "this tooth doesn't exist"
+                    original_missing_mask.append(True)  # Signals: tooth is MISSING
 
 
             dentition_arr = np.array(dentition_arr).reshape(len(FDIS), self.tooth_npoints, 3)

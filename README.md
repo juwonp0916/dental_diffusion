@@ -48,7 +48,7 @@ nvcc --version
 ## Training
 ```
 python3 train_generation.py --bs [] --workers [] --niter []
-python3 train_generation.py --bs 4 --workers 4 --niter 100
+python3 train_generation.py --bs 8 --workers 8 --niter 100 --grad_clip 1.0
 
 ``
 

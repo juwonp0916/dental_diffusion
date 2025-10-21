@@ -1,7 +1,7 @@
 import os
 os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
 # os.environ['CUDA_VISIBLE_DEVICES'] = "0,1,2,3,4,5,6,7"
-os.environ['CUDA_VISIBLE_DEVICES'] = "0,1,2,3"
+os.environ['CUDA_VISIBLE_DEVICES'] = "6,7"
 
 from collections import OrderedDict
 import re
@@ -18,7 +18,7 @@ from utils.file_utils import *
 from utils.visualize import *
 from model.pvcnn_generation import PVCNN2Base
 import torch.distributed as dist
-from datasets.dataset_generation import ToothDataset, FDIS, FDI_TO_IDX, IDX_TO_FDI
+from datasets.dataset_generation import ToothDataset, FDIS
 from datasets.augmentation_techniques import *
 from torchvision import transforms
 import json
@@ -272,6 +272,10 @@ class GaussianDiffusion:
         # Apply mask and compute MSE only on latent teeth
         masked_diff = (noise - eps_recon) * mask_expanded
 
+        # Check for NaN/Inf in intermediate computation
+        if torch.isnan(masked_diff).any() or torch.isinf(masked_diff).any():
+            return torch.tensor(0.0, device=noise.device, requires_grad=True)
+
         # Sum over all dimensions and normalize by number of masked elements
         num_masked_elements = mask_expanded.sum()
 
@@ -280,6 +284,10 @@ class GaussianDiffusion:
             return torch.tensor(0.0, device=noise.device, requires_grad=True)
 
         loss = (masked_diff ** 2).sum() / num_masked_elements
+
+        # Final check for NaN/Inf in computed loss
+        if torch.isnan(loss) or torch.isinf(loss):
+            return torch.tensor(0.0, device=noise.device, requires_grad=True)
 
         return loss
 
@@ -355,7 +363,7 @@ class Model(nn.Module):
         assert xt.dtype == torch.float
         assert t.shape == torch.Size([B]) and t.dtype == torch.int64
 
-        # Extract fdi_indices (embedding indices [0-27]) as positional argument
+        # Extract fdi_indices (embedding indices [0-27] mapped from FDI positions)
         fdi_indices = model_kwargs['fdi_indices']
         out, attn_mask = self.model(xt, t, model_kwargs['x0'], fdi_indices,
                                      model_kwargs['l_mask'], model_kwargs['o_mask'],
@@ -427,6 +435,13 @@ def validate_training_scenario(latent_mask, obs_mask, original_missing_mask, bat
         if latent_count == 0:  # Need at least 1 tooth to reconstruct
             if logger:
                 logger.warning(f"Batch {batch_idx}, sample {b}: No teeth to reconstruct")
+            return False
+
+        # Check 2b: Ensure minimum total existing teeth for meaningful training
+        total_existing = obs_count + latent_count
+        if total_existing < 3:
+            if logger:
+                logger.warning(f"Batch {batch_idx}, sample {b}: Too few total existing teeth ({total_existing})")
             return False
 
         # Check 3: Ensure masks are consistent (no overlap)
@@ -520,7 +535,7 @@ def generate_val_samples(opt, model, val_dataset, outf_syn, epoch, device):
     sample_batch_size = 1 # how many validation samples to generate
     val_sample_list = val_dataset.sample_patient(sample_batch_size)
     val_dentition_points = torch.stack([sample['dentition_points'] for sample in val_sample_list], 0).to(device)
-    val_fdi_indices = torch.stack([sample['fdi_indices'] for sample in val_sample_list], 0).to(device)  # Embedding indices [0-27]
+    val_fdi_indices = torch.stack([sample['fdi_indices'] for sample in val_sample_list], 0).to(device)  # Embedding indices [0-27] from FDI positions
     val_bound = None
     if 'bounds_cyl' in val_sample_list[0]:
         val_bound = torch.stack([sample['bounds_cyl'] for sample in val_sample_list], 0).to(device)
@@ -568,7 +583,7 @@ def generate_val_samples(opt, model, val_dataset, outf_syn, epoch, device):
 
     val_data_dict = {
         'x0': val_dentition_points,
-        'fdi_indices': val_fdi_indices,  # Embedding indices [0-27]
+        'fdi_indices': val_fdi_indices,  # Embedding indices [0-27] from FDI positions
         'l_mask': latent_mask_val,
         'o_mask':obs_mask_val,
         'bound':val_bound,
@@ -649,25 +664,14 @@ def train(local_rank, opt, output_dir):
 
     torch.cuda.set_device(local_rank)
     device = torch.device('cuda', local_rank)
-
-    # Memory optimization settings
     torch.cuda.empty_cache()
     if hasattr(torch.cuda, 'set_per_process_memory_fraction'):
-        torch.cuda.set_per_process_memory_fraction(0.85)  # Reduced from 0.9 to leave more headroom
-
-    # Fix memory fragmentation by limiting block size
+        torch.cuda.set_per_process_memory_fraction(0.85)
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,expandable_segments:True'
-
-    if take_action:
-        logger.info('Memory optimization settings applied:')
-        logger.info(f'  - CUDA device: {local_rank}')
-        logger.info(f'  - Memory fraction: 0.85')
-        logger.info(f'  - Max split size: 128MB')
-
     model = model.to(device)
 
 
-    if opt.model != '': # if continue train
+    if opt.model != '':
         ckpt = torch.load(opt.model, map_location=device)
         try:
             model.load_state_dict(ckpt['model_state'])
@@ -690,10 +694,7 @@ def train(local_rank, opt, output_dir):
 
     model.multi_gpu_wrapper(_transform_)
 
-
-
-    lr_decay_epochs = [(opt.niter//4), (opt.niter//4)*2, (opt.niter//4)*3] # Decay learning rate by 0.25, 3 times throughout training
-
+    lr_decay_epochs = [(opt.niter//4), (opt.niter//4)*2, (opt.niter//4)*3]
 
     for epoch in range(start_epoch, opt.niter):
 
@@ -701,11 +702,10 @@ def train(local_rank, opt, output_dir):
 
         logger.info(f'RANK {local_rank}: Training start at epoch {epoch}')
 
-        
         for i, data in enumerate(dataloader):
 
             dentition_points = data['dentition_points'].to(device) # (b, K, 3, 1024)
-            fdi_indices = data['fdi_indices'].to(device)  # (b, 28) embedding indices [0-27]
+            fdi_indices = data['fdi_indices'].to(device)  # (b, 28) embedding indices [0-27] from FDI positions
             bound = data.get('bounds_cyl')  # Optional, may not be in dataset
             if bound is not None:
                 bound = bound.to(device)  # (b, 28, 5)
@@ -761,34 +761,61 @@ def train(local_rank, opt, output_dir):
             # IMPORTANT
             # obs_mask (observed mask): mask that indicates which teeth are existing context teeth
             # latent_mask: mask that indicates which teeth are simulated for omission and trying to reconstruct back
-
             noise_batch = torch.randn_like(dentition_points).to(device)
 
             data_dict = {
                 'x0': dentition_points,
-                'fdi_indices': fdi_indices,  # Embedding indices [0-27]
+                'fdi_indices': fdi_indices,  # Embedding indices [0-27] from FDI positions
                 'l_mask': latent_mask,
                 'o_mask':obs_mask,
                 'bound':bound,
-                'original_missing_mask': original_missing_mask  # For attention masking
+                'original_missing_mask': original_missing_mask 
             }
+            if torch.isnan(dentition_points).any() or torch.isinf(dentition_points).any():
+                continue
+
+            if torch.isnan(noise_batch).any() or torch.isinf(noise_batch).any():
+                continue
+
             loss = model.get_loss_iter_teethmask(noise_batch, model_kwargs=data_dict)
 
             # Check for NaN loss immediately
             if torch.isnan(loss) or torch.isinf(loss):
                 if take_action:
-                    logger.error(f"[{epoch:>3d}/{opt.niter:>3d}][{i:>3d}/{len(dataloader):>3d}] NaN/Inf loss detected! Skipping batch.")
-                    logger.error(f"   dentition_points range: [{dentition_points.min().item():.4f}, {dentition_points.max().item():.4f}]")
-                    logger.error(f"   noise_batch range: [{noise_batch.min().item():.4f}, {noise_batch.max().item():.4f}]")
-                    logger.error(f"   latent_mask sum: {latent_mask.sum().item()}")
-                    logger.error(f"   obs_mask sum: {obs_mask.sum().item()}")
-                continue  # Skip this batch
+                    # Detailed error reporting
+                    if torch.isnan(loss):
+                        logger.error(f"[{epoch:>3d}/{opt.niter:>3d}][{i:>3d}/{len(dataloader):>3d}] *** NaN loss detected! ***")
+                    elif torch.isposinf(loss):
+                        logger.error(f"[{epoch:>3d}/{opt.niter:>3d}][{i:>3d}/{len(dataloader):>3d}] *** +Inf loss detected! ***")
+                    elif torch.isneginf(loss):
+                        logger.error(f"[{epoch:>3d}/{opt.niter:>3d}][{i:>3d}/{len(dataloader):>3d}] *** -Inf loss detected! ***")
+                    else:
+                        logger.error(f"[{epoch:>3d}/{opt.niter:>3d}][{i:>3d}/{len(dataloader):>3d}] *** Unknown Inf/NaN issue! ***")
+
+                    logger.error(f"   Loss value: {loss.item()}")
+                    logger.error(f"   dentition_points - min: {dentition_points.min().item():.4f}, max: {dentition_points.max().item():.4f}, mean: {dentition_points.mean().item():.4f}")
+                    logger.error(f"   noise_batch - min: {noise_batch.min().item():.4f}, max: {noise_batch.max().item():.4f}, mean: {noise_batch.mean().item():.4f}")
+                    logger.error(f"   latent_mask sum: {latent_mask.sum().item()}, obs_mask sum: {obs_mask.sum().item()}")
+                    logger.error(f"   fdi_indices - min: {fdi_indices.min().item()}, max: {fdi_indices.max().item()}")
+                continue 
 
             # Optimize network parameters
             optimizer.zero_grad()
-            loss.backward()
 
-            # Gradient clipping to prevent NaN
+            # Backward pass with anomaly detection
+            try:
+                with torch.autograd.set_detect_anomaly(True):
+                    loss.backward()
+            except RuntimeError as e:
+                if take_action:
+                    logger.error(f"[{epoch:>3d}/{opt.niter:>3d}][{i:>3d}/{len(dataloader):>3d}] RuntimeError during backward pass!")
+                    logger.error(f"   Error message: {str(e)}")
+                    logger.error(f"   Loss value: {loss.item():.4f}")
+                optimizer.zero_grad()  
+                torch.cuda.empty_cache()
+                continue 
+
+            # Gradient clipping
             if opt.grad_clip is not None and opt.grad_clip > 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), opt.grad_clip)
                 if take_action and i % opt.print_freq == 0:
@@ -806,15 +833,14 @@ def train(local_rank, opt, output_dir):
             if has_nan_grad:
                 if take_action:
                     logger.error(f"[{epoch:>3d}/{opt.niter:>3d}][{i:>3d}/{len(dataloader):>3d}] NaN/Inf gradients detected! Skipping optimizer step.")
-                optimizer.zero_grad()  # Clear bad gradients
-                continue  # Skip optimizer step
+                optimizer.zero_grad()  
+                continue 
 
             optimizer.step()
 
-            # Clear memory after EVERY batch to prevent OOM
             torch.cuda.empty_cache()
 
-            # Print progress
+        # Output Important Data during training process
             if i % opt.print_freq == 0 and take_action:
                 logger.info('[{:>3d}/{:>3d}][{:>3d}/{:>3d}]    loss: {:>10.4f},    '
                             .format(epoch, opt.niter, i, len(dataloader), loss.item()))
@@ -900,14 +926,14 @@ def parse_args():
     # Model parameters
     parser.add_argument('--attention', type=eval, default=True)
     parser.add_argument('--dropout', type=float, default=0.1)
-    parser.add_argument('--embed_dim', type=int, default=128)
+    parser.add_argument('--embed_dim', type=int, default=96)  # Reduced from 128 to 96 for memory efficiency
     parser.add_argument('--loss_type', type=str, default='mse')
     parser.add_argument('--model_mean_type', type=str, default='eps')
     parser.add_argument('--model_var_type', type=str, default='fixedsmall')
     parser.add_argument('--vox_res_mult', type=float, default=1.0)
-    parser.add_argument('--width_mult', type=float, default=1.0)
+    parser.add_argument('--width_mult', type=float, default=0.75)  # Reduced from 1.0 to 0.85 for memory efficiency
 
-    parser.add_argument('--lr', type=float, default=3e-5, help='learning rate for E, default=0.0002')
+    parser.add_argument('--lr', type=float, default=2e-4, help='learning rate for E, default=0.0002')
     parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for adam. default=0.5')
     parser.add_argument('--decay', type=float, default=0, help='weight decay for EBM')
     parser.add_argument('--grad_clip', type=float, default=None, help='weight decay for EBM')

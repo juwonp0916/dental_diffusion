@@ -12,7 +12,8 @@
 #
 # CRITICAL: NumPy 2.x is incompatible with PyTorch 2.1.2
 # You MUST use NumPy 1.x (1.24.x is recommended for Python 3.11 + PyTorch 2.1.2)
-
+'''''''
+]]]]]]]]]]]]]]]]]2]]
 matplotlib==3.10.3
 numpy<2.0,>=1.24.0
 tqdm==4.67.1
