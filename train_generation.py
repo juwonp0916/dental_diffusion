@@ -1,7 +1,7 @@
 import os
 os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
 # os.environ['CUDA_VISIBLE_DEVICES'] = "0,1,2,3,4,5,6,7"
-os.environ['CUDA_VISIBLE_DEVICES'] = "6,7"
+os.environ['CUDA_VISIBLE_DEVICES'] = "0,1,2,3"
 
 from collections import OrderedDict
 import re
