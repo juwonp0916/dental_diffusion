@@ -36,23 +36,44 @@ class Attention(nn.Module):
 
         self.sm = nn.Softmax(-1)
 
-    def forward(self, x, attn_mask=None):
+    def forward(self, x, attn_mask=None, debug=False):
         """
         Args:
             x: Input features (B, C, ...)
             attn_mask: Optional attention mask (B,) - True for positions to MASK OUT (missing teeth)
                        Will be expanded to match attention matrix dimensions
+            debug: If True, print detailed debugging information when NaN is detected
         """
         B, C = x.shape[:2]
         h = x
+
+        # DEBUG: Check input for NaN
+        if debug and torch.isnan(x).any():
+            print(f"[Attention DEBUG] NaN in INPUT x: {torch.isnan(x).sum().item()} elements")
+            print(f"  x shape: {x.shape}, x range: [{x.min():.4f}, {x.max():.4f}]")
 
         q = self.q(h).reshape(B, C, -1)
         k = self.k(h).reshape(B, C, -1)
         v = self.v(h).reshape(B, C, -1)
 
+        # DEBUG: Check Q, K, V for NaN
+        if debug and (torch.isnan(q).any() or torch.isnan(k).any() or torch.isnan(v).any()):
+            print(f"[Attention DEBUG] NaN in Q/K/V projections!")
+            print(f"  Q has NaN: {torch.isnan(q).any()}, range: [{q.min():.4f}, {q.max():.4f}]")
+            print(f"  K has NaN: {torch.isnan(k).any()}, range: [{k.min():.4f}, {k.max():.4f}]")
+            print(f"  V has NaN: {torch.isnan(v).any()}, range: [{v.min():.4f}, {v.max():.4f}]")
+
         # Apply scaling for numerical stability (standard scaled dot-product attention)
         scale = (int(C) ** (-0.5))
         qk = torch.matmul(q.permute(0, 2, 1), k) * scale  # (B, seq_len, seq_len)
+
+        # DEBUG: Check attention scores before masking
+        if debug:
+            print(f"[Attention DEBUG] Attention scores (before masking):")
+            print(f"  qk shape: {qk.shape}, range: [{qk.min():.4f}, {qk.max():.4f}]")
+            print(f"  qk has NaN: {torch.isnan(qk).any()}, has Inf: {torch.isinf(qk).any()}")
+            if attn_mask is not None:
+                print(f"  attn_mask shape: {attn_mask.shape}, num_masked: {attn_mask.sum().item()}/{attn_mask.numel()}")
 
         # Apply attention mask if provided
         if attn_mask is not None:
@@ -71,7 +92,25 @@ class Attention(nn.Module):
             # This makes softmax output 0 for those positions
             qk = qk.masked_fill(mask_expanded, float('-inf'))
 
+            # DEBUG: Check after masking
+            if debug:
+                num_inf = torch.isinf(qk).sum().item()
+                print(f"[Attention DEBUG] After masking: {num_inf} elements set to -inf")
+
         w = self.sm(qk)
+
+        # DEBUG: Check softmax output
+        if debug and torch.isnan(w).any():
+            print(f"[Attention DEBUG] NaN detected in softmax output!")
+            print(f"  w shape: {w.shape}, NaN count: {torch.isnan(w).sum().item()}")
+            print(f"  w range (non-NaN): [{w[~torch.isnan(w)].min():.4f}, {w[~torch.isnan(w)].max():.4f}]")
+            # Check which batch elements have NaN
+            nan_mask = torch.isnan(w).any(dim=-1).any(dim=-1)  # (B,)
+            if nan_mask.any():
+                nan_indices = torch.where(nan_mask)[0]
+                print(f"  NaN in batch elements: {nan_indices.tolist()}")
+                if attn_mask is not None:
+                    print(f"  Corresponding mask values: {attn_mask[nan_indices].tolist()}")
 
         # Handle case where entire row is masked (all -inf) -> softmax gives nan
         # Replace nan with 0 (no attention)
@@ -79,11 +118,29 @@ class Attention(nn.Module):
 
         h = torch.matmul(v, w.permute(0, 2, 1)).reshape(B, C, *x.shape[2:])
 
+        # DEBUG: Check after attention application
+        if debug and torch.isnan(h).any():
+            print(f"[Attention DEBUG] NaN in attention output h!")
+            print(f"  h has NaN: {torch.isnan(h).sum().item()} elements")
+
         h = self.out(h)
+
+        # DEBUG: Check after output projection
+        if debug and torch.isnan(h).any():
+            print(f"[Attention DEBUG] NaN after output projection!")
 
         x = h + x
 
+        # DEBUG: Check after residual
+        if debug and torch.isnan(x).any():
+            print(f"[Attention DEBUG] NaN after residual connection!")
+
         x = self.nonlin(self.norm(x))
+
+        # DEBUG: Check final output
+        if debug and torch.isnan(x).any():
+            print(f"[Attention DEBUG] NaN in FINAL OUTPUT!")
+            print(f"  NaN count: {torch.isnan(x).sum().item()}/{x.numel()}")
 
         return x
 

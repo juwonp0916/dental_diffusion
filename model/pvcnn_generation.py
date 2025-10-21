@@ -190,7 +190,7 @@ class PVCNN2Base(nn.Module):
         self.in_channels = extra_feature_channels + 3
         self.use_checkpoint = use_checkpoint  # Enable gradient checkpointing to save memory
 
-        # embedding to uniquely identify fdi
+        # embedding to uniquely identify fdi position (not existence - use tooth_exists_indicator for that)
         self.fdi_embedding = nn.Embedding(num_embeddings=28, embedding_dim=8)
 
         sa_layers, sa_in_channels, channels_sa_features, _ = create_pointnet2_sa_components(
@@ -254,11 +254,11 @@ class PVCNN2Base(nn.Module):
 
         # xt: (B, 28, 3, 1024)
         # x0: (B, 28, 3, 1024)
-        # fdi_indices: (B, 28) - embedding indices [0-27] or 0 for missing teeth
+        # fdi_indices: (B, 28) - embedding indices [0-27] mapped from FDI tooth positions
         # o_mask: (B, 28, 1, 1)
         # l_mask: (B, 28, 1, 1)
         # bound (B, 28, 5) or None
-        # original_missing_mask: (B, 28) - True for naturally missing teeth
+        # original_missing_mask: (B, 28) - True for naturally missing teeth (use this for tooth existence check)
 
         B, nT, nD, nP = xt.shape
         t = t.view(B, 1).expand(B, nT).reshape(B*nT)
@@ -289,14 +289,16 @@ class PVCNN2Base(nn.Module):
 
         temb = temb_raw[:, :, None].expand(-1, -1, xt.shape[-1])
 
-        # Create binary indicator: 1 if tooth naturally exists (fdi_indices > 0), 0 if missing (fdi_indices == 0)
-        # Note: fdi_indices contains embedding indices [0-27], with 0 indicating missing teeth
-        tooth_exists_mask = (fdi_indices > 0).float().unsqueeze(-1).unsqueeze(-1)  # (B, 28, 1, 1)
+        # Create binary indicator: 1 if tooth naturally exists, 0 if missing
+        # Use original_missing_mask to identify missing teeth (not fdi_indices anymore)
+        if original_missing_mask is not None:
+            tooth_exists_mask = (~original_missing_mask).float().unsqueeze(-1).unsqueeze(-1)  # (B, 28, 1, 1)
+        else:
+            tooth_exists_mask = torch.ones((B, nT, 1, 1), device=xt.device)
 
-        # Memory optimization: use expand instead of creating new tensors with ones_like
-        obs_indicator = o_mask.expand(-1, -1, 1, nP)  # (B, 28, 1, 1024) - no new memory allocation
-        fdi_embeddings = fdi_embeddings.unsqueeze(3).expand(-1, -1, -1, nP)  # (B, 28, 8, 1024) - use expand instead of repeat
-        tooth_exists_indicator = tooth_exists_mask.expand(-1, -1, 1, nP)  # (B, 28, 1, 1024) - no new memory allocation
+        obs_indicator = o_mask.expand(-1, -1, 1, nP)  # (B, 28, 1, 1024) 
+        fdi_embeddings = fdi_embeddings.unsqueeze(3).expand(-1, -1, -1, nP)  # (B, 28, 8, 1024) t
+        tooth_exists_indicator = tooth_exists_mask.expand(-1, -1, 1, nP)  # (B, 28, 1, 1024) 
 
         x = torch.cat([
             xt*l_mask + x0*o_mask,
@@ -318,7 +320,7 @@ class PVCNN2Base(nn.Module):
             if self.use_checkpoint and self.training:
                 # Use gradient checkpointing during training to save memory
                 if i == 0:
-                    features, coords, temb = checkpoint(sa_blocks, (features, coords, temb), use_reentrant=False)
+                    features, coor1ds, temb = checkpoint(sa_blocks, (features, coords, temb), use_reentrant=False)
                 else:
                     features, coords, temb = checkpoint(sa_blocks, (torch.cat([features, temb], dim=1), coords, temb), use_reentrant=False)
             else:
@@ -331,11 +333,12 @@ class PVCNN2Base(nn.Module):
         in_features_list[0] = x[:, 3:, :].contiguous()
 
         if self.global_att is not None:
+            debug_attention = False  # Set to True to enable detailed NaN debugging
             if self.use_checkpoint and self.training:
                 # Pass attention mask through checkpoint
-                features = checkpoint(lambda *args: self.global_att(*args), features, attn_mask, use_reentrant=False)
+                features = checkpoint(lambda *args: self.global_att(*args), features, attn_mask, debug_attention, use_reentrant=False)
             else:
-                features = self.global_att(features, attn_mask)
+                features = self.global_att(features, attn_mask, debug=debug_attention)
   
         # Feature propagation layer with gradient checkpointing
         for fp_idx, fp_blocks in enumerate(self.fp_layers):  # 4 layers

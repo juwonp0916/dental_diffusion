@@ -10,3 +10,5 @@ mask_change.md
 debug_cuda_compliation.py
 COMPLETE_PICTURE.md
 check_data_stats.py
+potential.md
+debug_nan_source.py
