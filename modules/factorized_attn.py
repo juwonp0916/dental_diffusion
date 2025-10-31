@@ -209,13 +209,31 @@ class RPEAttention(nn.Module):
         # softmax where all elements with mask==0 can attend to eachother and all with mask==1
         # can attend to eachother (but elements with mask==0 can't attend to elements with mask==1)
         def softmax(w, attn_mask):
+            # IMPORTANT: Compute softmax FIRST, then mask to avoid NaN gradients
+            # Using -inf masking before softmax causes softmax([-inf, -inf, ...]) = NaN in backward pass
+
+            # Clamp attention scores to prevent extreme values (numerical stability)
+            # This prevents overflow in softmax after many training epochs
+            w = th.clamp(w, min=-50.0, max=50.0)
+
+            w_soft = th.softmax(w.float(), dim=-1).type(w.dtype)
+
             if attn_mask is not None:
+                # Create allowed interaction mask
                 allowed_interactions = attn_mask.view(B, 1, T) * attn_mask.view(B, T, 1)
                 allowed_interactions += (1-attn_mask.view(B, 1, T)) * (1-attn_mask.view(B, T, 1))
-                inf_mask = (1-allowed_interactions)
-                inf_mask[inf_mask == 1] = th.inf
-                w = w - inf_mask.view(B, 1, 1, T, T)  # BxDxHxTxT
-            return th.softmax(w.float(), dim=-1).type(w.dtype)
+
+                # Zero out disallowed attention weights (NOT using -inf before softmax)
+                # This is numerically stable and prevents NaN gradients
+                disallowed_mask = (1 - allowed_interactions).view(B, 1, 1, T, T)
+                w_soft = w_soft * (1 - disallowed_mask)
+
+                # Renormalize to sum to 1 for numerical stability
+                # Add small epsilon to prevent division by zero
+                w_sum = w_soft.sum(dim=-1, keepdim=True) + 1e-8
+                w_soft = w_soft / w_sum
+
+            return w_soft
 
         attn = softmax(attn, attn_mask)
         out = attn @ v

@@ -45,6 +45,16 @@ class Attention(nn.Module):
             debug: If True, print detailed debugging information when NaN is detected
         """
         B, C = x.shape[:2]
+
+        # CRITICAL: Check if input has NaN and handle it
+        if torch.isnan(x).any():
+            if debug:
+                print(f"[Attention DEBUG] NaN in INPUT x: {torch.isnan(x).sum().item()} elements")
+                print(f"  x shape: {x.shape}")
+                print(f"  WARNING: Input to attention is corrupted! Replacing NaN with zeros.")
+            # Replace NaN with zeros to prevent propagation
+            x = torch.where(torch.isnan(x), torch.zeros_like(x), x)
+
         h = x
 
         # DEBUG: Check input for NaN
@@ -76,70 +86,65 @@ class Attention(nn.Module):
                 print(f"  attn_mask shape: {attn_mask.shape}, num_masked: {attn_mask.sum().item()}/{attn_mask.numel()}")
 
         # Apply attention mask if provided
+        # Compute softmax BEFORE masking to avoid NaN in backward pass
+        # This is critical: masking with -inf before softmax causes softmax([-inf, -inf, ...]) = NaN
+        # which breaks gradient computation even if we clean NaN in forward pass
+        w = self.sm(qk)
+
+        # DEBUG: Check softmax output before masking
+        if debug:
+            print(f"[Attention DEBUG] Softmax output (before masking):")
+            print(f"  w shape: {w.shape}, range: [{w.min():.4f}, {w.max():.4f}]")
+            print(f"  w has NaN: {torch.isnan(w).any()}, has Inf: {torch.isinf(w).any()}")
+
+        # NOW apply mask by zeroing out attention weights for missing teeth
+        # This approach avoids NaN entirely (no softmax of all -inf)
         if attn_mask is not None:
-            # attn_mask shape: (B*28,) with True for positions to mask out (missing teeth)
-            # qk shape: (B*28, seq_len, seq_len) where seq_len depends on point cloud resolution
+            # attn_mask shape: (B*28,) with True for missing teeth
+            # w shape: (B*28, seq_len, seq_len)
 
-            # For global attention: seq_len = number of points after pooling (usually 1)
-            # The mask indicates which BATCH ELEMENTS (teeth) should be ignored
-            # We need to mask out entire batch elements, not specific sequence positions
+            # Expand mask to cover all attention weights
+            mask_expanded = attn_mask.view(-1, 1, 1)  # (B*28, 1, 1) -> broadcast to (B*28, seq_len, seq_len)
 
-            # Expand mask to cover all sequence positions
-            # mask shape: (B*28, 1, 1) -> broadcast to (B*28, seq_len, seq_len)
-            mask_expanded = attn_mask.view(-1, 1, 1)  # (B*28, 1, 1)
-
-            # Set attention weights to -inf for masked batch elements
-            # This makes softmax output 0 for those positions
-            qk = qk.masked_fill(mask_expanded, float('-inf'))
+            # Zero out attention weights for missing teeth
+            # This is mathematically sound and avoids gradient issues
+            w = w.masked_fill(mask_expanded, 0.0)
 
             # DEBUG: Check after masking
             if debug:
-                num_inf = torch.isinf(qk).sum().item()
-                print(f"[Attention DEBUG] After masking: {num_inf} elements set to -inf")
+                num_masked = (w == 0).sum().item()
+                print(f"[Attention DEBUG] After masking: {num_masked} attention weights zeroed")
+                print(f"  w has NaN: {torch.isnan(w).any()}, has Inf: {torch.isinf(w).any()}")
 
-        w = self.sm(qk)
-
-        # DEBUG: Check softmax output
+        # Sanity check - should never have NaN with this approach
         if debug and torch.isnan(w).any():
-            print(f"[Attention DEBUG] NaN detected in softmax output!")
-            print(f"  w shape: {w.shape}, NaN count: {torch.isnan(w).sum().item()}")
-            print(f"  w range (non-NaN): [{w[~torch.isnan(w)].min():.4f}, {w[~torch.isnan(w)].max():.4f}]")
-            # Check which batch elements have NaN
-            nan_mask = torch.isnan(w).any(dim=-1).any(dim=-1)  # (B,)
-            if nan_mask.any():
-                nan_indices = torch.where(nan_mask)[0]
-                print(f"  NaN in batch elements: {nan_indices.tolist()}")
-                if attn_mask is not None:
-                    print(f"  Corresponding mask values: {attn_mask[nan_indices].tolist()}")
-
-        # Handle case where entire row is masked (all -inf) -> softmax gives nan
-        # Replace nan with 0 (no attention)
-        w = torch.where(torch.isnan(w), torch.zeros_like(w), w)
+            print(f"[Attention DEBUG] UNEXPECTED NaN in attention weights!")
+            print(f"  This should not happen with the new masking approach")
 
         h = torch.matmul(v, w.permute(0, 2, 1)).reshape(B, C, *x.shape[2:])
 
         # DEBUG: Check after attention application
         if debug and torch.isnan(h).any():
-            print(f"[Attention DEBUG] NaN in attention output h!")
-            print(f"  h has NaN: {torch.isnan(h).sum().item()} elements")
+            print(f"[Attention DEBUG] UNEXPECTED NaN in attention output h!")
 
         h = self.out(h)
 
         # DEBUG: Check after output projection
         if debug and torch.isnan(h).any():
-            print(f"[Attention DEBUG] NaN after output projection!")
+            print(f"[Attention DEBUG] UNEXPECTED NaN after output projection!")
 
+        # Residual connection
         x = h + x
 
         # DEBUG: Check after residual
         if debug and torch.isnan(x).any():
-            print(f"[Attention DEBUG] NaN after residual connection!")
+            print(f"[Attention DEBUG] UNEXPECTED NaN after residual connection!")
 
         x = self.nonlin(self.norm(x))
 
         # DEBUG: Check final output
         if debug and torch.isnan(x).any():
-            print(f"[Attention DEBUG] NaN in FINAL OUTPUT!")
+            print(f"[Attention DEBUG] UNEXPECTED NaN in FINAL OUTPUT!")
             print(f"  NaN count: {torch.isnan(x).sum().item()}/{x.numel()}")
 
         return x
@@ -147,16 +152,17 @@ class Attention(nn.Module):
 
 class PVConv(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, resolution, attention=False,
-                 dropout=0.1, with_se=False, with_se_relu=False, normalize=True, eps=0):
+                 dropout=0.1, with_se=False, with_se_relu=False, normalize=True, eps=1e-6):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.kernel_size = kernel_size
         self.resolution = resolution
+        self.use_attention = attention
 
         self.voxelization = Voxelization(resolution, normalize=normalize, eps=eps)
 
-
+        # Build voxel processing layers, extracting Attention for separate handling
         voxel_layers = [nn.Conv3d(in_channels, out_channels, kernel_size, stride=1, padding=kernel_size // 2),
                         nn.GroupNorm(num_groups=8, num_channels=out_channels),
                         Swish()]
@@ -164,33 +170,89 @@ class PVConv(nn.Module):
         voxel_layers += [nn.Dropout(dropout)] if dropout is not None else []
 
         voxel_layers += [nn.Conv3d(out_channels, out_channels, kernel_size, stride=1, padding=kernel_size // 2),
-                         nn.GroupNorm(num_groups=8, num_channels=out_channels),
-                         Attention(out_channels, 8) if attention else Swish()]
+                         nn.GroupNorm(num_groups=8, num_channels=out_channels)]
 
-        if with_se:
-            voxel_layers.append(SE3d(out_channels, use_relu=with_se_relu))
+        # Store main voxel layers without Attention/Swish
         self.voxel_layers = nn.Sequential(*voxel_layers)
+
+        # Store Attention separately so it can receive attn_mask, or use Swish
+        if attention:
+            self.voxel_attention = Attention(out_channels, 8)
+        else:
+            self.voxel_attention = Swish()
+
+        # Store SE separately if needed
+        if with_se:
+            self.voxel_se = SE3d(out_channels, use_relu=with_se_relu)
+        else:
+            self.voxel_se = None
+
         self.point_features = SharedMLP(in_channels, out_channels)
 
-    def forward(self, inputs):
+    def forward(self, inputs, attn_mask=None, debug=False):
         features, coords, temb = inputs
+
+        if debug:
+            print(f"[PVConv DEBUG] Input - features NaN: {torch.isnan(features).any()}, coords NaN: {torch.isnan(coords).any()}")
+            print(f"  coords stats: min={coords.min().item():.6f}, max={coords.max().item():.6f}, mean={coords.mean().item():.6f}")
+
         voxel_features, voxel_coords = self.voxelization(features, coords)
+
+        if debug:
+            print(f"[PVConv DEBUG] After voxelization - voxel_features NaN: {torch.isnan(voxel_features).any()}")
+            if torch.isnan(voxel_features).any():
+                print(f"  *** NaN in voxelization output! ***")
+                return torch.zeros_like(features), coords, temb  # Emergency fallback
+
+        # Apply voxel convolution layers
         voxel_features = self.voxel_layers(voxel_features)
+
+        if debug:
+            print(f"[PVConv DEBUG] After voxel_layers - NaN: {torch.isnan(voxel_features).any()}")
+
+        # Apply attention with mask if using attention, otherwise apply activation
+        if self.use_attention and attn_mask is not None:
+            voxel_features = self.voxel_attention(voxel_features, attn_mask, debug=debug)
+        else:
+            voxel_features = self.voxel_attention(voxel_features)
+
+        if debug:
+            print(f"[PVConv DEBUG] After attention/activation - NaN: {torch.isnan(voxel_features).any()}")
+
+        # Apply SE if present
+        if self.voxel_se is not None:
+            voxel_features = self.voxel_se(voxel_features)
+
+        if debug:
+            print(f"[PVConv DEBUG] After SE - NaN: {torch.isnan(voxel_features).any()}")
+
+        # Devoxelize back to point locations
         voxel_features = F.trilinear_devoxelize(voxel_features, voxel_coords, self.resolution, self.training)
+
+        if debug:
+            print(f"[PVConv DEBUG] After devoxelization - NaN: {torch.isnan(voxel_features).any()}")
+
         fused_features = voxel_features + self.point_features(features)
+
+        if debug:
+            print(f"[PVConv DEBUG] After fusion - NaN: {torch.isnan(fused_features).any()}")
+
         return fused_features, coords, temb
 
 
 class PVConvReLU(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, resolution, attention=False, leak=0.2,
-                 dropout=0.1, with_se=False, with_se_relu=False, normalize=True, eps=0):
+                 dropout=0.1, with_se=False, with_se_relu=False, normalize=True, eps=1e-6):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.kernel_size = kernel_size
         self.resolution = resolution
+        self.use_attention = attention
 
         self.voxelization = Voxelization(resolution, normalize=normalize, eps=eps)
+
+        # Build voxel processing layers, extracting Attention for separate handling
         voxel_layers = [
             nn.Conv3d(in_channels, out_channels, kernel_size, stride=1, padding=kernel_size // 2),
             nn.BatchNorm3d(out_channels),
@@ -199,18 +261,44 @@ class PVConvReLU(nn.Module):
         voxel_layers += [nn.Dropout(dropout)] if dropout is not None else []
         voxel_layers += [
             nn.Conv3d(out_channels, out_channels, kernel_size, stride=1, padding=kernel_size // 2),
-            nn.BatchNorm3d(out_channels),
-            Attention(out_channels, 8) if attention else nn.LeakyReLU(leak, True)
+            nn.BatchNorm3d(out_channels)
         ]
-        if with_se:
-            voxel_layers.append(SE3d(out_channels, use_relu=with_se_relu))
+
+        # Store main voxel layers without Attention/LeakyReLU
         self.voxel_layers = nn.Sequential(*voxel_layers)
+
+        # Store Attention separately so it can receive attn_mask, or use LeakyReLU
+        if attention:
+            self.voxel_attention = Attention(out_channels, 8)
+        else:
+            self.voxel_attention = nn.LeakyReLU(leak, True)
+
+        # Store SE separately if needed
+        if with_se:
+            self.voxel_se = SE3d(out_channels, use_relu=with_se_relu)
+        else:
+            self.voxel_se = None
+
         self.point_features = SharedMLP(in_channels, out_channels)
 
-    def forward(self, inputs):
+    def forward(self, inputs, attn_mask=None):
         features, coords, temb = inputs
         voxel_features, voxel_coords = self.voxelization(features, coords)
+
+        # Apply voxel convolution layers
         voxel_features = self.voxel_layers(voxel_features)
+
+        # Apply attention with mask if using attention, otherwise apply activation
+        if self.use_attention and attn_mask is not None:
+            voxel_features = self.voxel_attention(voxel_features, attn_mask)
+        else:
+            voxel_features = self.voxel_attention(voxel_features)
+
+        # Apply SE if present
+        if self.voxel_se is not None:
+            voxel_features = self.voxel_se(voxel_features)
+
+        # Devoxelize back to point locations
         voxel_features = F.trilinear_devoxelize(voxel_features, voxel_coords, self.resolution, self.training)
         fused_features = voxel_features + self.point_features(features)
         return fused_features, coords, temb

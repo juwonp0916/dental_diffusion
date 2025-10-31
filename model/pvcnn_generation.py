@@ -72,7 +72,7 @@ def create_pointnet_components(blocks, in_channels, embed_dim, with_se=False, no
 
 
 def create_pointnet2_sa_components(sa_blocks, extra_feature_channels, embed_dim=64, use_att=False,
-                                   dropout=0.1, with_se=False, normalize=True, eps=0,
+                                   dropout=0.1, with_se=False, normalize=True, eps=1e-6,
                                    width_multiplier=1, voxel_resolution_multiplier=1):
     r, vr = width_multiplier, voxel_resolution_multiplier
     in_channels = extra_feature_channels + 3
@@ -138,7 +138,7 @@ def create_pointnet2_sa_components(sa_blocks, extra_feature_channels, embed_dim=
 
 def create_pointnet2_fp_modules(fp_blocks, in_channels, sa_in_channels, embed_dim=64, use_att=False,
                                 dropout=0.1,
-                                with_se=False, normalize=True, eps=0,
+                                with_se=False, normalize=True, eps=1e-6,
                                 width_multiplier=1, voxel_resolution_multiplier=1):
     r, vr = width_multiplier, voxel_resolution_multiplier
 
@@ -250,7 +250,7 @@ class PVCNN2Base(nn.Module):
         return emb
 
 
-    def forward(self, xt, t, x0, fdi_indices, l_mask, o_mask, bound, original_missing_mask=None):
+    def forward(self, xt, t, x0, fdi_indices, l_mask, o_mask, bound, original_missing_mask=None, debug_nan=False):
 
         # xt: (B, 28, 3, 1024)
         # x0: (B, 28, 3, 1024)
@@ -259,9 +259,17 @@ class PVCNN2Base(nn.Module):
         # l_mask: (B, 28, 1, 1)
         # bound (B, 28, 5) or None
         # original_missing_mask: (B, 28) - True for naturally missing teeth (use this for tooth existence check)
+        # debug_nan: If True, print detailed NaN tracking through the network
 
         B, nT, nD, nP = xt.shape
         t = t.view(B, 1).expand(B, nT).reshape(B*nT)
+
+        if debug_nan:
+            print(f"\n{'='*80}")
+            print(f"[NaN TRACE] Starting forward pass")
+            print(f"[NaN TRACE] Input xt has NaN: {torch.isnan(xt).any()}")
+            print(f"[NaN TRACE] Input x0 has NaN: {torch.isnan(x0).any()}")
+            print(f"{'='*80}")
 
         # Create attention mask for global attention from original_missing_mask
         # Shape: (B*28,) - True for positions to mask out in attention
@@ -306,8 +314,16 @@ class PVCNN2Base(nn.Module):
             obs_indicator,            # 1 channel  - is this tooth used as context?
             tooth_exists_indicator    # 1 channel  - does this tooth naturally exist in patient?
         ], dim=2)
-        # x: (B, 28, (3+8+1+1), 1024) = (B, 28, 13, 1024) 
+        # x: (B, 28, (3+8+1+1), 1024) = (B, 28, 13, 1024)
         x = x.reshape(B*nT, nD+self.extra_feature_channels, nP)
+
+        if debug_nan:
+            print(f"[NaN TRACE] After input concatenation, x has NaN: {torch.isnan(x).any()}")
+            if torch.isnan(x).any():
+                print(f"[NaN TRACE] Breaking down components:")
+                print(f"  - xt*l_mask + x0*o_mask has NaN: {torch.isnan(xt*l_mask + x0*o_mask).any()}")
+                print(f"  - fdi_embeddings has NaN: {torch.isnan(fdi_embeddings).any()}")
+                print(f"  - temb has NaN: {torch.isnan(temb).any()}")
 
         coords, features = x[:, :3, :].contiguous(), x
         coords_list, in_features_list = [], []
@@ -317,41 +333,103 @@ class PVCNN2Base(nn.Module):
             in_features_list.append(features)
             coords_list.append(coords)
 
-            if self.use_checkpoint and self.training:
-                # Use gradient checkpointing during training to save memory
-                if i == 0:
-                    features, coor1ds, temb = checkpoint(sa_blocks, (features, coords, temb), use_reentrant=False)
-                else:
-                    features, coords, temb = checkpoint(sa_blocks, (torch.cat([features, temb], dim=1), coords, temb), use_reentrant=False)
+            # Prepare input
+            if i == 0:
+                input_tuple = (features, coords, temb)
             else:
-                # Normal forward pass during evaluation
-                if i == 0:
-                    features, coords, temb = sa_blocks((features, coords, temb))
+                input_tuple = (torch.cat([features, temb], dim=1), coords, temb)
+
+            # Handle Sequential blocks
+            # NOTE: Do NOT pass attn_mask to SA layers - they operate on POINTS within each tooth (spatial),
+            # not on TEETH across the dentition (semantic). The mask is tooth-level, not point-level.
+            if isinstance(sa_blocks, nn.Sequential):
+                output = input_tuple
+                for layer_idx, layer in enumerate(sa_blocks):
+                    # Enable detailed debug for first PVConv block in first SA layer
+                    if debug_nan and i == 0 and hasattr(layer, 'forward') and 'debug' in layer.forward.__code__.co_varnames:
+                        print(f"[NaN TRACE] SA layer {i}, block {layer_idx} ({type(layer).__name__})")
+                        if self.use_checkpoint and self.training:
+                            output = checkpoint(layer, output, True, use_reentrant=False)  # debug=True
+                        else:
+                            output = layer(output, debug=True)
+                    else:
+                        if self.use_checkpoint and self.training:
+                            output = checkpoint(layer, output, use_reentrant=False)
+                        else:
+                            output = layer(output)
+                features, coords, temb = output
+            else:
+                # Single module case
+                if self.use_checkpoint and self.training:
+                    features, coords, temb = checkpoint(sa_blocks, input_tuple, use_reentrant=False)
                 else:
-                    features, coords, temb = sa_blocks((torch.cat([features, temb], dim=1), coords, temb))
+                    features, coords, temb = sa_blocks(input_tuple)
+
+            if debug_nan:
+                print(f"[NaN TRACE] After SA layer {i}, features has NaN: {torch.isnan(features).any()}")
+                if torch.isnan(features).any():
+                    print(f"[NaN TRACE] *** NaN first appeared in SA layer {i} ***")
 
         in_features_list[0] = x[:, 3:, :].contiguous()
 
         if self.global_att is not None:
-            debug_attention = False  # Set to True to enable detailed NaN debugging
-            if self.use_checkpoint and self.training:
-                # Pass attention mask through checkpoint
-                features = checkpoint(lambda *args: self.global_att(*args), features, attn_mask, debug_attention, use_reentrant=False)
-            else:
-                features = self.global_att(features, attn_mask, debug=debug_attention)
-  
+            debug_attention = debug_nan  # Use same debug flag
+            # IMPORTANT: Disable checkpointing for global attention to ensure correct mask passing
+            # The checkpoint mechanism has issues with keyword arguments in closures
+            features = self.global_att(features, attn_mask, debug=debug_attention)
+
+            if debug_nan:
+                print(f"[NaN TRACE] After global attention, features has NaN: {torch.isnan(features).any()}")
+                if torch.isnan(features).any():
+                    print(f"[NaN TRACE] *** NaN first appeared in global attention ***")
+
         # Feature propagation layer with gradient checkpointing
         for fp_idx, fp_blocks in enumerate(self.fp_layers):  # 4 layers
 
             jump_coords = coords_list[-1 - fp_idx]
             fump_feats = in_features_list[-1 - fp_idx]
 
-            if self.use_checkpoint and self.training:
-                features, coords, temb = checkpoint(fp_blocks, (jump_coords, coords, torch.cat([features, temb], dim=1), fump_feats, temb), use_reentrant=False)
+            # Handle Sequential blocks
+            # NOTE: Do NOT pass attn_mask to FP layers - same reason as SA layers
+            # FP layer PVConv attention is point-level (spatial), not tooth-level (semantic)
+            if isinstance(fp_blocks, nn.Sequential):
+                output = (jump_coords, coords, torch.cat([features, temb], dim=1), fump_feats, temb)
+
+                for layer_idx, layer in enumerate(fp_blocks):
+                    if layer_idx == 0:
+                        # First layer is PointNetFPModule
+                        if self.use_checkpoint and self.training:
+                            output = checkpoint(layer, output, use_reentrant=False)
+                        else:
+                            output = layer(output)
+                        features, coords, temb = output
+                    else:
+                        # Subsequent layers (e.g., PVConv)
+                        input_tuple = (features, coords, temb)
+                        if self.use_checkpoint and self.training:
+                            output = checkpoint(layer, input_tuple, use_reentrant=False)
+                        else:
+                            output = layer(input_tuple)
+                        features, coords, temb = output
             else:
-                features, coords, temb = fp_blocks((jump_coords, coords, torch.cat([features, temb], dim=1), fump_feats, temb))
+                # Single module case (just PointNetFPModule, no attn_mask needed)
+                if self.use_checkpoint and self.training:
+                    features, coords, temb = checkpoint(fp_blocks, (jump_coords, coords, torch.cat([features, temb], dim=1), fump_feats, temb), use_reentrant=False)
+                else:
+                    features, coords, temb = fp_blocks((jump_coords, coords, torch.cat([features, temb], dim=1), fump_feats, temb))
+
+            if debug_nan:
+                print(f"[NaN TRACE] After FP layer {fp_idx}, features has NaN: {torch.isnan(features).any()}")
+                if torch.isnan(features).any():
+                    print(f"[NaN TRACE] *** NaN first appeared in FP layer {fp_idx} ***")
 
         out = self.classifier(features)
+
+        if debug_nan:
+            print(f"[NaN TRACE] After classifier, out has NaN: {torch.isnan(out).any()}")
+            if torch.isnan(out).any():
+                print(f"[NaN TRACE] *** NaN first appeared in classifier ***")
+            print(f"{'='*80}\n")
 
         out = out.view(B, nT, nD, nP)
 

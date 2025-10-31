@@ -1,7 +1,7 @@
 import os
 os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
 # os.environ['CUDA_VISIBLE_DEVICES'] = "0,1,2,3,4,5,6,7"
-os.environ['CUDA_VISIBLE_DEVICES'] = "0,1,2,3"
+os.environ['CUDA_VISIBLE_DEVICES'] = "0,1,2,3,4,5,6,7"
 
 from collections import OrderedDict
 import re
@@ -257,7 +257,7 @@ class GaussianDiffusion:
     ----- Losses ----- 
     '''
 
-    def mse_mean_flat(self, B, noise, eps_recon, mask):
+    def mse_mean_flat(self, B, noise, eps_recon, mask, debug=False):
         """
         Take the mean over all non-batch dimensions, considering only unmasked elements.
 
@@ -265,34 +265,58 @@ class GaussianDiffusion:
             noise: (B, 28, 3, 1024) - ground truth noise
             eps_recon: (B, 28, 3, 1024) - predicted noise
             mask: (B, 28, 1, 1) - latent mask indicating which teeth to reconstruct
+            debug: If True, print detailed debugging information
         """
         # Expand mask to match noise dimensions: (B, 28, 1, 1) -> (B, 28, 3, 1024)
         mask_expanded = mask.expand_as(noise)  # (B, 28, 3, 1024)
 
+        # DEBUG: Check mask
+        if debug:
+            print(f"[MSE DEBUG] mask shape: {mask.shape}, num_nonzero: {mask.sum().item()}")
+            print(f"[MSE DEBUG] mask_expanded shape: {mask_expanded.shape}, num_nonzero: {mask_expanded.sum().item()}")
+
         # Apply mask and compute MSE only on latent teeth
         masked_diff = (noise - eps_recon) * mask_expanded
 
+        # DEBUG: Check inputs
+        if debug:
+            print(f"[MSE DEBUG] noise - min: {noise.min():.4f}, max: {noise.max():.4f}, has_nan: {torch.isnan(noise).any()}")
+            print(f"[MSE DEBUG] eps_recon - min: {eps_recon.min():.4f}, max: {eps_recon.max():.4f}, has_nan: {torch.isnan(eps_recon).any()}")
+            print(f"[MSE DEBUG] masked_diff - min: {masked_diff.min():.4f}, max: {masked_diff.max():.4f}, has_nan: {torch.isnan(masked_diff).any()}")
+
         # Check for NaN/Inf in intermediate computation
         if torch.isnan(masked_diff).any() or torch.isinf(masked_diff).any():
+            if debug:
+                print(f"[MSE DEBUG] *** RETURNING 0.0: NaN/Inf in masked_diff ***")
             return torch.tensor(0.0, device=noise.device, requires_grad=True)
 
         # Sum over all dimensions and normalize by number of masked elements
         num_masked_elements = mask_expanded.sum()
 
+        if debug:
+            print(f"[MSE DEBUG] num_masked_elements: {num_masked_elements.item()}")
+
         if num_masked_elements == 0:
             # No latent teeth to reconstruct - return zero loss
+            if debug:
+                print(f"[MSE DEBUG] *** RETURNING 0.0: num_masked_elements == 0 ***")
             return torch.tensor(0.0, device=noise.device, requires_grad=True)
 
         loss = (masked_diff ** 2).sum() / num_masked_elements
 
+        if debug:
+            print(f"[MSE DEBUG] computed loss: {loss.item():.6f}")
+
         # Final check for NaN/Inf in computed loss
         if torch.isnan(loss) or torch.isinf(loss):
+            if debug:
+                print(f"[MSE DEBUG] *** RETURNING 0.0: NaN/Inf in final loss ***")
             return torch.tensor(0.0, device=noise.device, requires_grad=True)
 
         return loss
 
-    def p_losses(self, denoise_fn, t, noise, model_kwargs):
-        
+    def p_losses(self, denoise_fn, t, noise, model_kwargs, debug=False):
+
         data_start = model_kwargs['x0']
 
         B = data_start.shape[0]
@@ -302,11 +326,16 @@ class GaussianDiffusion:
 
         if self.loss_type == 'mse':
 
-            eps_recon, _  = denoise_fn(data_t, 
-                                       t, 
-                                       model_kwargs)
-    
-            losses = self.mse_mean_flat(B, noise, eps_recon, model_kwargs['l_mask']) # only calculate loss on target, ignore context teetn
+            eps_recon, _  = denoise_fn(data_t,
+                                       t,
+                                       model_kwargs,
+                                       debug_nan=debug)
+
+            if debug:
+                print(f"[P_LOSSES DEBUG] eps_recon shape: {eps_recon.shape}")
+                print(f"[P_LOSSES DEBUG] eps_recon - min: {eps_recon.min():.4f}, max: {eps_recon.max():.4f}, has_nan: {torch.isnan(eps_recon).any()}")
+
+            losses = self.mse_mean_flat(B, noise, eps_recon, model_kwargs['l_mask'], debug=debug) # only calculate loss on target, ignore context teetn
 
         elif self.loss_type == 'kl':
             pass
@@ -357,7 +386,7 @@ class Model(nn.Module):
                             use_att=args.attention, dropout=args.dropout, extra_feature_channels=args.extra_feature_nc,
                             width_multiplier=width_mult, voxel_resolution_multiplier=vox_res_mult)
 
-    def _denoise(self, xt, t, model_kwargs):
+    def _denoise(self, xt, t, model_kwargs, debug_nan=False):
         B = xt.shape[0]
 
         assert xt.dtype == torch.float
@@ -368,20 +397,27 @@ class Model(nn.Module):
         out, attn_mask = self.model(xt, t, model_kwargs['x0'], fdi_indices,
                                      model_kwargs['l_mask'], model_kwargs['o_mask'],
                                      model_kwargs.get('bound'),
-                                     model_kwargs.get('original_missing_mask'))
+                                     model_kwargs.get('original_missing_mask'),
+                                     debug_nan=debug_nan)
 
         return out, attn_mask
 
-    def get_loss_iter_teethmask(self, noise_batch, model_kwargs):
+    def get_loss_iter_teethmask(self, noise_batch, model_kwargs, debug=False):
 
         dentition_points = model_kwargs['x0']
         B = dentition_points.shape[0]
         t = torch.randint(0, self.diffusion.num_timesteps, size=(B,), device=noise_batch.device)
-        
-        losses = self.diffusion.p_losses(denoise_fn=self._denoise, 
-                                         t=t, 
+
+        if debug:
+            print(f"[GET_LOSS DEBUG] batch size: {B}, timestep range: [0, {self.diffusion.num_timesteps})")
+            print(f"[GET_LOSS DEBUG] dentition_points shape: {dentition_points.shape}")
+            print(f"[GET_LOSS DEBUG] l_mask sum: {model_kwargs['l_mask'].sum().item()}")
+
+        losses = self.diffusion.p_losses(denoise_fn=self._denoise,
+                                         t=t,
                                          noise=noise_batch,
-                                         model_kwargs=model_kwargs)
+                                         model_kwargs=model_kwargs,
+                                         debug=debug)
 
         return losses
 
@@ -515,13 +551,14 @@ def get_dataloader(opt, dataset, local_rank, mode = 'train'):
         shuffle = (mode=='train')
     )
 
-    dataloader = torch.utils.data.DataLoader(dataset, 
-                                                batch_size=opt.bs, 
+    dataloader = torch.utils.data.DataLoader(dataset,
+                                                batch_size=opt.bs,
                                                 sampler=sampler,
-                                                shuffle=sampler is None, 
+                                                shuffle=sampler is None,
                                                 num_workers=int(opt.workers),
-                                                pin_memory = False,
-                                                persistent_workers = False,  # Reduced memory usage
+                                                pin_memory=True,  # CRITICAL: Fast CPU→GPU transfer
+                                                persistent_workers=True,  # CRITICAL: Keep workers alive between epochs
+                                                prefetch_factor=4,  # CRITICAL: Prefetch 4 batches per worker
                                                 drop_last=False)
     
     return dataloader, sampler
@@ -777,63 +814,34 @@ def train(local_rank, opt, output_dir):
             if torch.isnan(noise_batch).any() or torch.isinf(noise_batch).any():
                 continue
 
-            loss = model.get_loss_iter_teethmask(noise_batch, model_kwargs=data_dict)
+            loss = model.get_loss_iter_teethmask(noise_batch, model_kwargs=data_dict, debug=False)
 
-            # Check for NaN loss immediately
-            if torch.isnan(loss) or torch.isinf(loss):
-                if take_action:
-                    # Detailed error reporting
-                    if torch.isnan(loss):
-                        logger.error(f"[{epoch:>3d}/{opt.niter:>3d}][{i:>3d}/{len(dataloader):>3d}] *** NaN loss detected! ***")
-                    elif torch.isposinf(loss):
-                        logger.error(f"[{epoch:>3d}/{opt.niter:>3d}][{i:>3d}/{len(dataloader):>3d}] *** +Inf loss detected! ***")
-                    elif torch.isneginf(loss):
-                        logger.error(f"[{epoch:>3d}/{opt.niter:>3d}][{i:>3d}/{len(dataloader):>3d}] *** -Inf loss detected! ***")
-                    else:
-                        logger.error(f"[{epoch:>3d}/{opt.niter:>3d}][{i:>3d}/{len(dataloader):>3d}] *** Unknown Inf/NaN issue! ***")
-
-                    logger.error(f"   Loss value: {loss.item()}")
-                    logger.error(f"   dentition_points - min: {dentition_points.min().item():.4f}, max: {dentition_points.max().item():.4f}, mean: {dentition_points.mean().item():.4f}")
-                    logger.error(f"   noise_batch - min: {noise_batch.min().item():.4f}, max: {noise_batch.max().item():.4f}, mean: {noise_batch.mean().item():.4f}")
-                    logger.error(f"   latent_mask sum: {latent_mask.sum().item()}, obs_mask sum: {obs_mask.sum().item()}")
-                    logger.error(f"   fdi_indices - min: {fdi_indices.min().item()}, max: {fdi_indices.max().item()}")
+            # Check for NaN/Inf/Zero loss and skip silently
+            if torch.isnan(loss) or torch.isinf(loss) or loss.item() == 0.0:
                 continue 
 
             # Optimize network parameters
             optimizer.zero_grad()
 
-            # Backward pass with anomaly detection
-            try:
-                with torch.autograd.set_detect_anomaly(True):
-                    loss.backward()
-            except RuntimeError as e:
-                if take_action:
-                    logger.error(f"[{epoch:>3d}/{opt.niter:>3d}][{i:>3d}/{len(dataloader):>3d}] RuntimeError during backward pass!")
-                    logger.error(f"   Error message: {str(e)}")
-                    logger.error(f"   Loss value: {loss.item():.4f}")
-                optimizer.zero_grad()  
-                torch.cuda.empty_cache()
-                continue 
+            # Backward pass
+            loss.backward() 
 
             # Gradient clipping
             if opt.grad_clip is not None and opt.grad_clip > 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), opt.grad_clip)
-                if take_action and i % opt.print_freq == 0:
-                    logger.info(f'   Gradient norm: {grad_norm.item():.4f}')
+                torch.nn.utils.clip_grad_norm_(model.parameters(), opt.grad_clip)
 
-            # Check for NaN gradients
-            has_nan_grad = False
-            for name, param in model.named_parameters():
+            # Check for NaN gradients/parameters (skip batch if found)
+            has_nan = False
+            for param in model.parameters():
+                if torch.isnan(param).any() or torch.isinf(param).any():
+                    has_nan = True
+                    break
                 if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
-                    if take_action:
-                        logger.error(f"   NaN/Inf gradient in {name}")
-                    has_nan_grad = True
+                    has_nan = True
                     break
 
-            if has_nan_grad:
-                if take_action:
-                    logger.error(f"[{epoch:>3d}/{opt.niter:>3d}][{i:>3d}/{len(dataloader):>3d}] NaN/Inf gradients detected! Skipping optimizer step.")
-                optimizer.zero_grad()  
+            if has_nan:
+                optimizer.zero_grad()
                 continue 
 
             optimizer.step()
@@ -936,7 +944,7 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=2e-4, help='learning rate for E, default=0.0002')
     parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for adam. default=0.5')
     parser.add_argument('--decay', type=float, default=0, help='weight decay for EBM')
-    parser.add_argument('--grad_clip', type=float, default=None, help='weight decay for EBM')
+    parser.add_argument('--grad_clip', type=float, default=1.0, help='gradient clipping threshold (IMPORTANT for stability, default=1.0)')
     parser.add_argument('--lr_gamma', type=float, default=1, help='lr decay for EBM')
     parser.add_argument('--lr_decay_factor', type=float, default=0.45, help='')
 

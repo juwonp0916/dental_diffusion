@@ -118,47 +118,42 @@ class ToothDataset(th.utils.data.Dataset):
         self.preloaded_dentition = {}
 
         # Get all patient folders (both U and L variants)
+        # IMPORTANT: Each jaw (U/L) is treated as a SEPARATE sample
         patient_folders = []
         for folder in os.listdir(self.data_path):
             if os.path.isdir(os.path.join(self.data_path, folder)) and ('U' in folder or 'L' in folder):
                 patient_folders.append(folder)
 
-        # Group by patient base ID (e.g., DBT1_0002L and DBT1_0002U -> DBT1_0002)
-        patient_groups = {}
-        for folder in patient_folders:
-            base_id = folder[:-1]  # Remove 'U' or 'L' suffix
-            if base_id not in patient_groups:
-                patient_groups[base_id] = []
-            patient_groups[base_id].append(folder)
+        # Sort to ensure consistent ordering
+        patient_folders = sorted(patient_folders)
 
-        # Create patient list based on mode (using 80/20 split for now)
-        all_patients = sorted(patient_groups.keys())
-        split_idx = int(0.8 * len(all_patients))
+        # Create patient list based on mode (using 80/20 split)
+        # Each jaw folder is a separate sample
+        split_idx = int(0.8 * len(patient_folders))
 
         if self.mode == 'train':
-            patient_id_list = all_patients[:split_idx]
+            jaw_folder_list = patient_folders[:split_idx]
         else:  # val mode
-            patient_id_list = all_patients[split_idx:]
+            jaw_folder_list = patient_folders[split_idx:]
 
-        print(f'Preloading {len(patient_id_list)} patients for {self.mode} mode...')
+        print(f'Preloading {len(jaw_folder_list)} jaw samples for {self.mode} mode...')
 
-        for idx, patient_id in enumerate(patient_id_list):
-            self.preloaded_dentition[idx] = {'patient_id':patient_id, 'data':{}}
-            # self.preloaded_dentition[idx] = {'patient_id':patient_id, 'data':{}, 'bounds':{}}
+        for idx, jaw_folder in enumerate(jaw_folder_list):
+            self.preloaded_dentition[idx] = {'patient_id': jaw_folder, 'data': {}}
+            # self.preloaded_dentition[idx] = {'patient_id': jaw_folder, 'data': {}, 'bounds': {}}
 
-            # Load from both upper and lower jaw folders for this patient
-            for jaw_folder in patient_groups[patient_id]:
-                jaw_path = os.path.join(self.data_path, jaw_folder, 'verts')
-                if not os.path.exists(jaw_path):
+            # Load teeth from this specific jaw folder only
+            jaw_path = os.path.join(self.data_path, jaw_folder, 'verts')
+            if not os.path.exists(jaw_path):
+                continue
+
+            for vert_path in glob(os.path.join(jaw_path, '*')):
+                teeth_name = os.path.basename(vert_path)
+                fdi = int(teeth_name.split('_')[-1].replace('.npy','').replace('FDI',''))
+                if fdi not in FDIS:
                     continue
 
-                for vert_path in glob(os.path.join(jaw_path, '*')):
-                    teeth_name = os.path.basename(vert_path)
-                    fdi = int(teeth_name.split('_')[-1].replace('.npy','').replace('FDI',''))
-                    if fdi not in FDIS:
-                        continue
-
-                    self.preloaded_dentition[idx]['data'][fdi] = np.load(vert_path)
+                self.preloaded_dentition[idx]['data'][fdi] = np.load(vert_path)
 
                 # Bounding cylinder data - commented out for vertex-only processing
                 # bound_path = vert_path.replace('verts','bounding').replace('.npy','_bounding.json')

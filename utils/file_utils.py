@@ -25,20 +25,56 @@ def copy_source(file, output_dir):
     copyfile(file, os.path.join(output_dir, os.path.basename(file)))
 
 
+class TeeLogger:
+    """Redirects print() statements to both console and log file"""
+    def __init__(self, file_path, stream):
+        self.file = open(file_path, 'a')
+        self.stream = stream
+
+    def write(self, message):
+        self.stream.write(message)
+        self.file.write(message)
+        self.flush()
+
+    def flush(self):
+        self.stream.flush()
+        self.file.flush()
+
+    def close(self):
+        self.file.close()
+
 def setup_logging(output_dir):
     log_format = logging.Formatter("%(asctime)s : %(message)s")
     logger = logging.getLogger()
     logger.handlers = []
+
+    # Main log file for logger statements
     output_file = os.path.join(output_dir, 'output.log')
     file_handler = logging.FileHandler(output_file)
     file_handler.setFormatter(log_format)
     logger.addHandler(file_handler)
+
+    # Console handler (was missing!)
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(log_format)
+    logger.addHandler(console_handler)
+
+    # Error handler
     err_handler = logging.StreamHandler(sys.stderr)
     err_handler.setFormatter(log_format)
     logger.addHandler(err_handler)
+
     logger.setLevel(logging.INFO)
+
+    # IMPORTANT: Also redirect print() statements to log file
+    # This captures debug output from model that uses print()
+    debug_log_file = os.path.join(output_dir, 'debug.log')
+    sys.stdout = TeeLogger(debug_log_file, sys.__stdout__)
+    sys.stderr = TeeLogger(debug_log_file, sys.__stderr__)
+
+    logger.info(f"Logging initialized. Logs will be saved to:")
+    logger.info(f"  Main log: {output_file}")
+    logger.info(f"  Debug log (includes print statements): {debug_log_file}")
 
     return logger
 

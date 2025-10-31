@@ -7,7 +7,7 @@ __all__ = ['Voxelization']
 
 
 class Voxelization(nn.Module):
-    def __init__(self, resolution, normalize=True, eps=0):
+    def __init__(self, resolution, normalize=True, eps=1e-6):
         super().__init__()
         self.r = int(resolution)
         self.normalize = normalize

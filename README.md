@@ -48,7 +48,9 @@ nvcc --version
 ## Training
 ```
 python3 train_generation.py --bs [] --workers [] --niter []
-python3 train_generation.py --bs 8 --workers 8 --niter 100 --grad_clip 1.0
+python3 train_generation.py --bs 14 --workers 7 --niter 20000 --model output/train_generation/2025-10-31-13-53-33/epoch_699.pth --saveIter 100
+
 
 ``
 
+3
